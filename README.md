@@ -22,7 +22,7 @@ Then:
 1. Extract the ZIP.
 2. Connect the iPhone by USB and unlock it.
 3. Double-click `Install-Hello-App.cmd`.
-4. If Windows does not yet have Apple's USB/device support, the launcher attempts to install the official **Apple Devices** app from the Microsoft Store automatically and then retries the phone.
+4. The launcher attempts to start Apple's **Apple Devices** app automatically so its USB/mobile-device service is available.
 5. Tap **Trust** on the iPhone when iOS asks.
 6. If Developer Mode is disabled, the launcher detects that and offers to enable/reveal it using the bundled open-source `idevicedevmodectl` helper. iOS may require a reboot/on-device confirmation.
 7. Enter the Apple development-account credentials and 2FA code requested by the bundled open-source Sideloader.
@@ -30,13 +30,17 @@ Then:
 
 A free Apple developer identity is enough for this test. Free provisioning normally expires after 7 days, so the app has to be signed again after that.
 
-The Windows launcher is regression-tested under Windows PowerShell 5.1, including the exact **one connected iPhone** case that previously caused scalar `.Count` failures. Releases are blocked if this regression test or the packaged Windows executable smoke tests fail.
+The Windows launcher is regression-tested under Windows PowerShell 5.1, including the exact **one connected iPhone** case that previously caused scalar `.Count` failures.
+
+The Release is also blocked until a GitHub **Windows** runner executes the same Apple Music/CoreADI provisioning path used by Sideloader, successfully provisions a fresh ADI identity, and reaches the login stage without a native Windows access violation. This allows us to catch provisioning crashes before using a physical iPhone as the test machine.
 
 ## What the release contains
 
 - `Exp2011App-unsigned.ipa` - the real ARM64 `iphoneos` build made by Xcode on GitHub's macOS runner.
 - `Exp2011App-OneClick-Windows.zip` - Windows bootstrap package containing the IPA, Dadoum Sideloader built from pinned source, Windows libimobiledevice pairing/device tools and runtime, and the guided installer.
 - `SHA256SUMS.txt` - checksums for both downloads.
+
+The current Windows runtime uses the newer Provision source pinned by the build, a current LDC compiler, trace logging, and isolated ADI state so a failed older provisioning attempt cannot contaminate the next test.
 
 The Windows package also contains the exact Sideloader source ZIP used to build its binary. Sideloader is GPL-3.0 licensed; the device communication runtime comes from the open-source libimobiledevice ecosystem.
 
@@ -54,11 +58,12 @@ Plain iOS does not install an arbitrary unsigned IPA merely by tapping the downl
 
 1. builds the native SwiftUI app for `iphoneos` with Xcode,
 2. packages the unsigned IPA,
-3. builds Dadoum Sideloader for Windows from a pinned open-source commit,
-4. bundles the Windows libimobiledevice runtime and pairing tools,
-5. regression-tests the Windows launcher under Windows PowerShell 5.1 and smoke-tests the packaged executables,
-6. creates the Windows one-click ZIP,
-7. publishes the IPA, Windows ZIP and SHA256 checksums to a new GitHub Release,
-8. writes the final CI result to `build-status.json` on `main` so the exact release pipeline can be verified.
+3. builds the traced Sideloader/Provision runtime on Windows,
+4. performs a fresh real Apple ADI provisioning preflight on that Windows runner,
+5. bundles the Windows libimobiledevice runtime and pairing tools,
+6. regression-tests the Windows launcher and smoke-tests the packaged executables,
+7. creates the Windows one-click ZIP,
+8. publishes the IPA, Windows ZIP and SHA256 checksums only after all gates pass,
+9. writes the final CI result to `build-status.json` on `main` so the exact release pipeline can be verified.
 
 All experimental project changes are committed directly to `main`; no PR/branch workflow is used for this test repository.
