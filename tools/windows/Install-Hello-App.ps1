@@ -4,6 +4,7 @@ Set-StrictMode -Version Latest
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
 $env:PATH = "$root;$env:PATH"
+$appleDevicesStoreId = '9NP83LWLPZ9K'
 
 function Stop-Friendly([string]$Message, [int]$Code = 1) {
     Write-Host ""
@@ -22,6 +23,68 @@ function Get-ConnectedDevices {
     }
 }
 
+function Install-AppleDeviceSupport {
+    Write-Host ""
+    Write-Host "Windows cannot see an Apple USB device yet." -ForegroundColor Yellow
+    Write-Host "Installing Apple's official Apple Devices component supplies the Windows"
+    Write-Host "Apple Mobile Device USB service used by libimobiledevice."
+    Write-Host ""
+
+    $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+    if ($winget) {
+        Write-Host "Trying Microsoft Store install through WinGet..." -ForegroundColor Cyan
+        & $winget.Source install --id $appleDevicesStoreId --source msstore `
+            --accept-source-agreements --accept-package-agreements `
+            --silent --disable-interactivity
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "Apple Devices install/update completed." -ForegroundColor Green
+        } else {
+            Write-Host "WinGet could not finish Apple Devices automatically (exit $LASTEXITCODE)." -ForegroundColor Yellow
+        }
+    }
+
+    $devices = Get-ConnectedDevices
+    if ($devices.Count -eq 0) {
+        Write-Host "Opening the official Apple Devices Microsoft Store page..." -ForegroundColor Cyan
+        Start-Process "ms-windows-store://pdp/?ProductId=$appleDevicesStoreId"
+        Write-Host "Install Apple Devices if the Store shows it is not installed."
+        Read-Host "After installation, reconnect/unlock the iPhone, tap Trust if prompted, then press Enter" | Out-Null
+    }
+}
+
+function Ensure-DeveloperMode([string]$Udid) {
+    $tool = Join-Path $root 'idevicedevmodectl.exe'
+    if (-not (Test-Path $tool)) { return }
+
+    try {
+        $statusText = (& $tool --udid $Udid list 2>&1 | Out-String)
+    } catch {
+        return
+    }
+
+    if ($statusText -notmatch '(?im)^\s*' + [regex]::Escape($Udid) + '\s+disabled\s*$') {
+        return
+    }
+
+    Write-Host ""
+    Write-Host "Developer Mode is currently disabled on the iPhone." -ForegroundColor Yellow
+    Write-Host "A development-signed sideloaded app needs Developer Mode on iOS 16+."
+    Write-Host "The open-source idevicedevmodectl helper can enable/reveal it."
+    Write-Host "If the phone has no passcode this can reboot it automatically; with a passcode"
+    Write-Host "iOS normally requires you to enable the revealed switch on the phone itself."
+    $answer = Read-Host "Try to enable/reveal Developer Mode now? [Y/n]"
+    if ($answer -match '^(n|no)$') { return }
+
+    & $tool --udid $Udid enable
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host ""
+        Write-Host "Finish Developer Mode on the iPhone:" -ForegroundColor Yellow
+        Write-Host "Settings > Privacy & Security > Developer Mode"
+        Write-Host "iOS may reboot and ask for an on-device confirmation."
+        Read-Host "Press Enter after Developer Mode is enabled and the iPhone is unlocked again" | Out-Null
+    }
+}
+
 Write-Host ""
 Write-Host "============================================================"
 Write-Host " Exp2011App - Hello iPhone sideload test"
@@ -36,7 +99,8 @@ $required = @(
     'sideloader.exe',
     'Exp2011App-unsigned.ipa',
     'idevice_id.exe',
-    'idevicepair.exe'
+    'idevicepair.exe',
+    'idevicedevmodectl.exe'
 )
 foreach ($name in $required) {
     if (-not (Test-Path (Join-Path $root $name))) {
@@ -44,19 +108,23 @@ foreach ($name in $required) {
     }
 }
 
+Write-Host "Connect the iPhone by USB, unlock it, and leave it unlocked." -ForegroundColor Cyan
 $devices = Get-ConnectedDevices
 if ($devices.Count -eq 0) {
-    Write-Host "No iPhone is visible yet." -ForegroundColor Yellow
-    Write-Host "1. Connect the iPhone by USB."
-    Write-Host "2. Unlock it."
-    Write-Host "3. Tap Trust if iOS asks whether to trust this computer."
-    Write-Host ""
-    Read-Host "Press Enter after the phone is connected and unlocked" | Out-Null
+    Install-AppleDeviceSupport
+    Start-Sleep -Seconds 2
     $devices = Get-ConnectedDevices
 }
 
 if ($devices.Count -eq 0) {
-    Stop-Friendly "No iPhone was detected. Reconnect the cable, unlock the phone, and run this installer again."
+    Write-Host "No iPhone is visible yet." -ForegroundColor Yellow
+    Write-Host "Reconnect USB, unlock the phone, and tap Trust if iOS asks."
+    Read-Host "Press Enter to retry detection" | Out-Null
+    $devices = Get-ConnectedDevices
+}
+
+if ($devices.Count -eq 0) {
+    Stop-Friendly "No iPhone was detected after installing/checking Apple Devices. Try another data-capable USB cable/port, open Apple Devices once, then rerun this installer."
 }
 
 if ($devices.Count -gt 1) {
@@ -69,7 +137,7 @@ $udid = $devices[0]
 Write-Host "Detected iPhone: $udid" -ForegroundColor Green
 Write-Host "Checking trust/pairing..."
 
-$validateOutput = & (Join-Path $root 'idevicepair.exe') validate 2>&1
+& (Join-Path $root 'idevicepair.exe') validate *> $null
 $paired = ($LASTEXITCODE -eq 0)
 
 if (-not $paired) {
@@ -94,10 +162,12 @@ if (-not $paired) {
 }
 
 Write-Host "Pairing OK." -ForegroundColor Green
+Ensure-DeveloperMode $udid
+
 Write-Host ""
 Write-Host "Starting Apple development signing + installation..." -ForegroundColor Cyan
-Write-Host "You will be asked for an Apple ID/password and, when Apple requires it, a 2FA code."
-Write-Host "A free Apple developer identity is sufficient for this test, but the app normally expires after 7 days."
+Write-Host "Sideloader will ask for an Apple ID/password and, when Apple requires it, a 2FA code."
+Write-Host "A free Apple developer identity is sufficient for this test; free provisioning normally expires after 7 days."
 Write-Host ""
 
 & (Join-Path $root 'sideloader.exe') install (Join-Path $root 'Exp2011App-unsigned.ipa') -i
@@ -110,10 +180,7 @@ Write-Host ""
 Write-Host "============================================================" -ForegroundColor Green
 Write-Host " INSTALL COMPLETED" -ForegroundColor Green
 Write-Host "============================================================" -ForegroundColor Green
-Write-Host "Look for 'exp2011app' on the iPhone."
-Write-Host ""
-Write-Host "If iOS blocks the first launch:"
-Write-Host "  - Settings > Privacy & Security > Developer Mode (enable if requested)."
-Write-Host "  - Settings > General > VPN & Device Management (trust your developer identity if shown)."
-Write-Host "A Developer Mode change can require an iPhone reboot and confirmation on-device."
+Write-Host "Look for 'exp2011app' on the iPhone and open it."
+Write-Host "If iOS still blocks launch, finish Developer Mode under Settings > Privacy & Security"
+Write-Host "and trust your developer identity under Settings > General > VPN & Device Management if shown."
 exit 0
