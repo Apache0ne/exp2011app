@@ -19,45 +19,23 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-
-      - name: Show Xcode version
-        run: xcodebuild -version
-
       - name: Install XcodeGen
         env:
           HOMEBREW_NO_AUTO_UPDATE: "1"
         run: brew install xcodegen
-
-      - name: Generate Xcode project
-        run: xcodegen generate
-
-      - name: Build unsigned iPhone app
+      - name: Build real iPhone app
         run: |
           set -euo pipefail
-          xcodebuild \
-            -project Exp2011App.xcodeproj \
-            -scheme Exp2011App \
-            -configuration Release \
-            -sdk iphoneos \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath build \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY='' \
-            build
-
-      - name: Package unsigned IPA
-        run: |
-          set -euo pipefail
-          APP_PATH="build/Build/Products/Release-iphoneos/Exp2011App.app"
-          test -d "$APP_PATH"
-          rm -rf Payload
+          xcodegen generate
+          xcodebuild -project Exp2011App.xcodeproj -scheme Exp2011App \
+            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' build
           mkdir Payload
-          cp -R "$APP_PATH" Payload/
+          cp -R build/Build/Products/Release-iphoneos/Exp2011App.app Payload/
           /usr/bin/zip -qry Exp2011App-unsigned.ipa Payload
           unzip -l Exp2011App-unsigned.ipa
           shasum -a 256 Exp2011App-unsigned.ipa
-
       - uses: actions/upload-artifact@v4
         with:
           name: Exp2011App-unsigned-ipa
@@ -73,72 +51,57 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Regression-test launcher in Windows PowerShell 5.1
+      - name: Test launcher on Windows PowerShell 5.1
         shell: powershell
         run: |
           Set-StrictMode -Version Latest
           $launcher = Join-Path $PWD 'tools/windows/Install-Hello-App.ps1'
-          $tokens = $null
-          $parseErrors = $null
-          [void][System.Management.Automation.Language.Parser]::ParseFile($launcher, [ref]$tokens, [ref]$parseErrors)
-          if (@($parseErrors).Count -ne 0) {
-            $parseErrors | Format-List | Out-String | Write-Host
-            throw 'Install-Hello-App.ps1 has PowerShell syntax errors'
-          }
-
-          function Mock-OneConnectedDevice { '00000000-MOCK-IPHONE-UDID' }
-          $devices = @(Mock-OneConnectedDevice)
-          if ($devices.Count -ne 1) { throw "One-device normalization failed: Count=$($devices.Count)" }
-          if ($devices[0] -ne '00000000-MOCK-IPHONE-UDID') { throw 'One-device indexing failed' }
-
-          $assignments = @(Select-String -Path $launcher -Pattern '^\s*\$devices\s*=.*Get-ConnectedDevice')
-          $badAssignments = @($assignments | Where-Object { $_.Line -notmatch '^\s*\$devices\s*=\s*@\(' })
-          if ($badAssignments.Count -ne 0) {
-            $badAssignments | ForEach-Object { Write-Host $_.Line }
-            throw 'Found an unwrapped connected-device assignment'
-          }
-          Write-Host 'Windows PowerShell 5.1 launcher regression test passed.'
+          $tokens = $null; $parseErrors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile($launcher,[ref]$tokens,[ref]$parseErrors)
+          if (@($parseErrors).Count) { throw 'Launcher has PowerShell syntax errors' }
+          function Mock-OneDevice { '00000000-MOCK-IPHONE' }
+          $devices = @(Mock-OneDevice)
+          if ($devices.Count -ne 1 -or $devices[0] -ne '00000000-MOCK-IPHONE') { throw 'One-device regression' }
+          $bad = @(Select-String $launcher '^\s*\$devices\s*=.*Get-ConnectedDevice' | Where-Object { $_.Line -notmatch '^\s*\$devices\s*=\s*@\(' })
+          if ($bad.Count) { throw 'Found unwrapped device assignment' }
+          Write-Host 'PowerShell 5.1 launcher regression PASS'
 
       - uses: actions/download-artifact@v4
         with:
           name: Exp2011App-unsigned-ipa
           path: incoming
 
-      - name: Set up current LDC
+      # 1.33 is deliberate: Sideloader's Botan 1.13.6 still uses D syntax rejected by
+      # current LDC, while this compiler is already proven to build this codebase.
+      - name: Set up compatible LDC
         uses: dlang-community/setup-dlang@v1
         with:
-          compiler: ldc-1.42.0
+          compiler: ldc-1.33.0
 
-      - name: Download pinned open-source Sideloader source
+      - name: Fetch and patch Sideloader
         shell: pwsh
         run: |
-          $url = "https://github.com/Dadoum/Sideloader/archive/$env:SIDELOADER_COMMIT.zip"
-          Invoke-WebRequest -Uri $url -OutFile Sideloader-source.zip
-          Expand-Archive Sideloader-source.zip -DestinationPath sideloader-src
+          Invoke-WebRequest "https://github.com/Dadoum/Sideloader/archive/$env:SIDELOADER_COMMIT.zip" -OutFile Sideloader-source.zip
+          Expand-Archive Sideloader-source.zip sideloader-src
           $dir = Get-ChildItem sideloader-src -Directory | Select-Object -First 1
-          if (-not $dir) { throw 'Sideloader source archive did not extract' }
+          if (-not $dir) { throw 'Sideloader source did not extract' }
           "SIDELOADER_DIR=$($dir.FullName)" | Out-File $env:GITHUB_ENV -Append
-
-      - name: Patch Windows runtime and Provision dependency
-        shell: pwsh
-        run: |
-          python tools/sideloader/patch_sideloader.py "$env:SIDELOADER_DIR"
-          $dub = Get-Content "$env:SIDELOADER_DIR/dub.json" -Raw | ConvertFrom-Json
-          if ($dub.dependencies.provision.version -ne $env:PROVISION_COMMIT) {
-            throw "Provision pin mismatch: $($dub.dependencies.provision.version)"
-          }
-          Write-Host "Using Provision $env:PROVISION_COMMIT"
+          python tools/sideloader/patch_sideloader.py "$($dir.FullName)"
+          $dub = Get-Content "$($dir.FullName)/dub.json" -Raw | ConvertFrom-Json
+          if ($dub.dependencies.provision.version -ne $env:PROVISION_COMMIT) { throw 'Provision pin mismatch' }
           ldc2 --version
 
-      - name: Build traced Sideloader CLI
+      - name: Build traced Sideloader
         shell: pwsh
         run: |
-          Push-Location "$env:SIDELOADER_DIR"
+          Push-Location $env:SIDELOADER_DIR
           dub build -b debug --compiler=ldc2 :cli-frontend
           Pop-Location
           if (-not (Test-Path "$env:SIDELOADER_DIR/bin/sideloader.exe")) { throw 'Missing sideloader.exe' }
 
-      - name: Exercise real Apple ADI provisioning on Windows
+      # This executes the same Apple Music/CoreADI provisioning that crashed on the
+      # physical PC, but requires neither an iPhone nor Apple-account credentials.
+      - name: Real Windows CoreADI provisioning preflight
         shell: powershell
         run: |
           $ErrorActionPreference = 'Continue'
@@ -146,102 +109,73 @@ jobs:
           Remove-Item $preflight -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force $preflight | Out-Null
           $env:SIDELOADER_CONFIG_DIR = $preflight
-
-          Push-Location "$env:SIDELOADER_DIR"
+          Push-Location $env:SIDELOADER_DIR
           $lines = @(& .\bin\sideloader.exe -d team list 2>&1)
           $code = $LASTEXITCODE
           Pop-Location
-
           $lines | ForEach-Object { Write-Host $_ }
           $text = $lines -join "`n"
-          Write-Host "ADI preflight exit code: $code"
+          Write-Host "CoreADI preflight exit=$code"
+          if ($code -eq -1073741819 -or $code -eq 3221225477) { throw 'CoreADI access violation 0xC0000005 reproduced in CI' }
+          if ($text -notmatch 'PROVISION-STAGE 3/3') { throw 'CoreADI provisioning did not return successfully' }
+          if ($text -notmatch 'Logging in\.\.\.') { throw 'Did not reach post-provisioning login stage' }
+          if ($code -ne 1) { throw "Expected noninteractive no-login exit 1, got $code" }
+          Write-Host 'REAL WINDOWS COREADI PROVISIONING PASS' -ForegroundColor Green
 
-          if ($code -eq -1073741819) {
-            throw 'ADI preflight reproduced Windows access violation 0xC0000005. Blocking Release.'
-          }
-          if ($text -notmatch 'Device provisioned successfully\.|Provisioning OK\.') {
-            throw 'ADI preflight did not complete Apple ADI provisioning. Blocking Release.'
-          }
-          if ($text -notmatch 'Logging in\.\.\.') {
-            throw 'ADI preflight never reached the post-provisioning login stage. Blocking Release.'
-          }
-          if ($code -ne 1) {
-            throw "ADI preflight expected non-interactive login exit code 1 after successful provisioning; got $code"
-          }
-          Write-Host 'REAL WINDOWS ADI PREFLIGHT PASSED.' -ForegroundColor Green
-
-      - name: Download Windows iPhone runtime
+      - name: Fetch Windows iPhone device runtime
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force device-runtime | Out-Null
-          gh release download "$env:LIBIMOBILEDEVICE_WINDOWS_TAG" `
-            --repo jrjr/libimobiledevice-windows `
-            --pattern 'libimobile-suite-latest_w64.zip' `
-            --dir device-runtime
-          Expand-Archive device-runtime/libimobile-suite-latest_w64.zip -DestinationPath device-runtime/extracted
+          gh release download "$env:LIBIMOBILEDEVICE_WINDOWS_TAG" --repo jrjr/libimobiledevice-windows `
+            --pattern 'libimobile-suite-latest_w64.zip' --dir device-runtime
+          Expand-Archive device-runtime/libimobile-suite-latest_w64.zip device-runtime/extracted
 
-      - name: Assemble and smoke-test Windows package
+      - name: Package and smoke-test Windows installer
         shell: pwsh
         run: |
           $dist = Join-Path $PWD 'dist/Exp2011App-OneClick-Windows'
           New-Item -ItemType Directory -Force $dist | Out-Null
           Copy-Item "$env:SIDELOADER_DIR/bin/sideloader.exe" "$dist/sideloader.exe"
-          Get-ChildItem "$env:SIDELOADER_DIR" -Recurse -Filter 'sideloader.pdb' -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object { Copy-Item $_.FullName "$dist/sideloader.pdb" -Force }
+          Get-ChildItem $env:SIDELOADER_DIR -Recurse -Filter sideloader.pdb -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object { Copy-Item $_.FullName "$dist/sideloader.pdb" }
           Copy-Item incoming/Exp2011App-unsigned.ipa "$dist/Exp2011App-unsigned.ipa"
-          Copy-Item tools/windows/Install-Hello-App.cmd "$dist/Install-Hello-App.cmd"
-          Copy-Item tools/windows/Install-Hello-App.ps1 "$dist/Install-Hello-App.ps1"
+          Copy-Item tools/windows/Install-Hello-App.* $dist
           Copy-Item Sideloader-source.zip "$dist/Sideloader-source-$env:SIDELOADER_COMMIT.zip"
           Copy-Item 'device-runtime/extracted/*' $dist -Recurse -Force
 
-          function Copy-DllAlias([string[]]$patterns, [string]$alias) {
-            foreach ($pattern in $patterns) {
-              $hit = Get-ChildItem $dist -File -Filter $pattern | Select-Object -First 1
-              if ($hit) {
-                Copy-Item $hit.FullName (Join-Path $dist $alias) -Force
-                return
-              }
+          function Alias-Dll([string[]]$patterns,[string]$name) {
+            foreach ($p in $patterns) {
+              $hit = Get-ChildItem $dist -File -Filter $p | Select-Object -First 1
+              if ($hit) { Copy-Item $hit.FullName (Join-Path $dist $name) -Force; return }
             }
-            throw "Could not create DLL alias $alias"
+            throw "Missing DLL for $name"
           }
-          Copy-DllAlias @('libimobiledevice-1.0*.dll','libimobiledevice*.dll') 'imobiledevice.dll'
-          Copy-DllAlias @('libplist-2.0*.dll','libplist*.dll') 'plist.dll'
-          Copy-DllAlias @('libusbmuxd-2.0*.dll','libusbmuxd*.dll') 'usbmuxd.dll'
-
+          Alias-Dll @('libimobiledevice-1.0*.dll','libimobiledevice*.dll') imobiledevice.dll
+          Alias-Dll @('libplist-2.0*.dll','libplist*.dll') plist.dll
+          Alias-Dll @('libusbmuxd-2.0*.dll','libusbmuxd*.dll') usbmuxd.dll
           if ($env:VCToolsRedistDir) {
             $crt = Join-Path $env:VCToolsRedistDir 'x64/Microsoft.VC143.CRT'
             if (Test-Path $crt) { Copy-Item "$crt/*.dll" $dist -Force }
           }
 
           @"
-          Exp2011App Hello Test - Windows installer bundle
-          iOS source commit: $env:GITHUB_SHA
-          Sideloader commit: $env:SIDELOADER_COMMIT
-          Provision commit: $env:PROVISION_COMMIT
-          LDC: 1.42.0 / debug traced build
-          Windows ADI preflight: PASSED before packaging
-          Start: double-click Install-Hello-App.cmd
+          Exp2011App Hello Test
+          iOS source: $env:GITHUB_SHA
+          Sideloader: $env:SIDELOADER_COMMIT
+          Provision: $env:PROVISION_COMMIT
+          LDC: 1.33.0 debug/trace
+          GitHub Windows CoreADI provisioning preflight: PASS
+          Run: Install-Hello-App.cmd
           "@ | Set-Content "$dist/README-FIRST.txt"
 
-          $required = @(
-            'sideloader.exe','Exp2011App-unsigned.ipa','Install-Hello-App.cmd','Install-Hello-App.ps1',
-            'idevice_id.exe','idevicepair.exe','idevicedevmodectl.exe','imobiledevice.dll','plist.dll','usbmuxd.dll'
-          )
-          foreach ($name in $required) {
-            if (-not (Test-Path (Join-Path $dist $name))) { throw "Missing packaged file: $name" }
-          }
-
+          $required = @('sideloader.exe','Exp2011App-unsigned.ipa','Install-Hello-App.cmd','Install-Hello-App.ps1','idevice_id.exe','idevicepair.exe','idevicedevmodectl.exe','imobiledevice.dll','plist.dll','usbmuxd.dll')
+          foreach ($f in $required) { if (-not (Test-Path (Join-Path $dist $f))) { throw "Missing $f" } }
           Push-Location $dist
-          & .\sideloader.exe version
-          if ($LASTEXITCODE -ne 0) { throw "sideloader.exe smoke test failed: $LASTEXITCODE" }
-          & .\idevice_id.exe --version
-          if ($LASTEXITCODE -ne 0) { throw "idevice_id.exe smoke test failed: $LASTEXITCODE" }
-          & .\idevicepair.exe --version
-          if ($LASTEXITCODE -ne 0) { throw "idevicepair.exe smoke test failed: $LASTEXITCODE" }
-          & .\idevicedevmodectl.exe --version
-          if ($LASTEXITCODE -ne 0) { throw "idevicedevmodectl.exe smoke test failed: $LASTEXITCODE" }
+          & .\sideloader.exe version; if ($LASTEXITCODE) { throw 'sideloader smoke test failed' }
+          & .\idevice_id.exe --version; if ($LASTEXITCODE) { throw 'idevice_id smoke test failed' }
+          & .\idevicepair.exe --version; if ($LASTEXITCODE) { throw 'idevicepair smoke test failed' }
+          & .\idevicedevmodectl.exe --version; if ($LASTEXITCODE) { throw 'idevicedevmodectl smoke test failed' }
           Pop-Location
-
-          Compress-Archive -Path "$dist/*" -DestinationPath Exp2011App-OneClick-Windows.zip -CompressionLevel Optimal
+          Compress-Archive "$dist/*" Exp2011App-OneClick-Windows.zip -CompressionLevel Optimal
           Get-FileHash Exp2011App-OneClick-Windows.zip -Algorithm SHA256
 
       - uses: actions/upload-artifact@v4
@@ -257,7 +191,6 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: Exp2011App-unsigned-ipa
@@ -266,23 +199,17 @@ jobs:
         with:
           name: Exp2011App-OneClick-Windows
           path: release-assets
-
-      - name: Create checksums and publish Release
+      - name: Publish gated Release
         shell: bash
         run: |
           set -euo pipefail
           cd release-assets
           sha256sum Exp2011App-unsigned.ipa Exp2011App-OneClick-Windows.zip > SHA256SUMS.txt
           cd ..
-          TAG="hello-build-${GITHUB_RUN_NUMBER}"
-          gh release create "$TAG" \
-            release-assets/Exp2011App-unsigned.ipa \
-            release-assets/Exp2011App-OneClick-Windows.zip \
-            release-assets/SHA256SUMS.txt \
-            --target "$GITHUB_SHA" \
-            --title "Hello iPhone Test ${GITHUB_RUN_NUMBER}" \
-            --notes $'End-to-end Hello iPhone sideload test.\n\nThis build is released only after the GitHub Windows runner itself downloads Apple Music, initializes CoreADI, completes Apple ADI provisioning, and reaches the login stage without a native crash. It also uses Provision 7717ce1, LDC 1.42, isolated provisioning state, trace logging, and automatic Apple Devices startup.\n\nDownload `Exp2011App-OneClick-Windows.zip`, extract it, connect and unlock the iPhone, then double-click `Install-Hello-App.cmd`.' \
-            --latest
+          gh release create "hello-build-${GITHUB_RUN_NUMBER}" \
+            release-assets/Exp2011App-unsigned.ipa release-assets/Exp2011App-OneClick-Windows.zip release-assets/SHA256SUMS.txt \
+            --target "$GITHUB_SHA" --title "Hello iPhone Test ${GITHUB_RUN_NUMBER}" --latest \
+            --notes $'Windows one-click Hello iPhone test.\n\nThis Release is published only after a GitHub Windows runner completes fresh Apple Music/CoreADI provisioning without a native crash. The launcher also auto-starts Apple Devices, uses isolated ADI state, and runs Sideloader with trace logging.'
 
   report-status:
     needs: [build-ios, build-windows-installer, release]
@@ -294,27 +221,19 @@ jobs:
       WINDOWS_RESULT: ${{ needs.build-windows-installer.result }}
       RELEASE_RESULT: ${{ needs.release.result }}
     steps:
-      - name: Write build-status.json to main
+      - name: Write build status to main
         shell: bash
         run: |
           set -euo pipefail
-          jq -n \
-            --arg run_id "$GITHUB_RUN_ID" \
-            --arg run_number "$GITHUB_RUN_NUMBER" \
-            --arg source_sha "$GITHUB_SHA" \
-            --arg ios "$IOS_RESULT" \
-            --arg windows "$WINDOWS_RESULT" \
-            --arg release "$RELEASE_RESULT" \
+          jq -n --arg run_id "$GITHUB_RUN_ID" --arg run_number "$GITHUB_RUN_NUMBER" --arg source_sha "$GITHUB_SHA" \
+            --arg ios "$IOS_RESULT" --arg windows "$WINDOWS_RESULT" --arg release "$RELEASE_RESULT" \
             --arg run_url "https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-            '{run_id:$run_id,run_number:$run_number,source_sha:$source_sha,build_ios:$ios,build_windows_installer:$windows,release:$release,run_url:$run_url}' \
-            > /tmp/build-status.json
-          CONTENT="$(base64 -w0 /tmp/build-status.json)"
+            '{run_id:$run_id,run_number:$run_number,source_sha:$source_sha,build_ios:$ios,build_windows_installer:$windows,release:$release,run_url:$run_url}' > /tmp/status.json
+          CONTENT="$(base64 -w0 /tmp/status.json)"
           OLD_SHA="$(gh api "repos/$GITHUB_REPOSITORY/contents/build-status.json?ref=main" --jq .sha 2>/dev/null || true)"
           if [[ -n "$OLD_SHA" ]]; then
-            gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/build-status.json" \
-              -f message='Update build status [skip release-status]' -f content="$CONTENT" -f sha="$OLD_SHA" -f branch=main >/dev/null
+            gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/build-status.json" -f message='Update build status [skip release-status]' -f content="$CONTENT" -f sha="$OLD_SHA" -f branch=main >/dev/null
           else
-            gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/build-status.json" \
-              -f message='Update build status [skip release-status]' -f content="$CONTENT" -f branch=main >/dev/null
+            gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/build-status.json" -f message='Update build status [skip release-status]' -f content="$CONTENT" -f branch=main >/dev/null
           fi
-          cat /tmp/build-status.json
+          cat /tmp/status.json
