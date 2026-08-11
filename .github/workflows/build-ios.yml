@@ -10,6 +10,7 @@ permissions:
 
 env:
   SIDELOADER_COMMIT: a589cf11a3ac7c1c26b2f18aa5acdc8afb6dc915
+  PROVISION_COMMIT: 7717ce1f7b3c9779fe9982005d07b6665071a239
   LIBIMOBILEDEVICE_WINDOWS_TAG: v20260809-74585f8
 
 jobs:
@@ -85,13 +86,11 @@ jobs:
             throw 'Install-Hello-App.ps1 has PowerShell syntax errors'
           }
 
-          # Exact regression: one pipeline result must still expose Count=1 and [0].
           function Mock-OneConnectedDevice { '00000000-MOCK-IPHONE-UDID' }
           $devices = @(Mock-OneConnectedDevice)
           if ($devices.Count -ne 1) { throw "One-device normalization failed: Count=$($devices.Count)" }
           if ($devices[0] -ne '00000000-MOCK-IPHONE-UDID') { throw 'One-device indexing failed' }
 
-          # Ensure every real device-result assignment in the launcher is explicitly @(...)-wrapped.
           $assignments = @(Select-String -Path $launcher -Pattern '^\s*\$devices\s*=.*Get-ConnectedDevice')
           $badAssignments = @($assignments | Where-Object { $_.Line -notmatch '^\s*\$devices\s*=\s*@\(' })
           if ($badAssignments.Count -ne 0) {
@@ -105,9 +104,10 @@ jobs:
           name: Exp2011App-unsigned-ipa
           path: incoming
 
-      - uses: dlang-community/setup-dlang@v1
+      - name: Set up current LDC
+        uses: dlang-community/setup-dlang@v1
         with:
-          compiler: ldc-1.33.0
+          compiler: ldc-1.42.0
 
       - name: Download pinned open-source Sideloader source
         shell: pwsh
@@ -119,15 +119,22 @@ jobs:
           if (-not $dir) { throw 'Sideloader source archive did not extract' }
           "SIDELOADER_DIR=$($dir.FullName)" | Out-File $env:GITHUB_ENV -Append
 
-      - name: Apply Windows usability patch
+      - name: Patch Windows runtime and Provision dependency
         shell: pwsh
-        run: python tools/sideloader/patch_sideloader.py "$env:SIDELOADER_DIR"
+        run: |
+          python tools/sideloader/patch_sideloader.py "$env:SIDELOADER_DIR"
+          $dub = Get-Content "$env:SIDELOADER_DIR/dub.json" -Raw | ConvertFrom-Json
+          if ($dub.dependencies.provision.version -ne $env:PROVISION_COMMIT) {
+            throw "Provision pin mismatch: $($dub.dependencies.provision.version)"
+          }
+          Write-Host "Using Provision $env:PROVISION_COMMIT"
+          ldc2 --version
 
-      - name: Build Sideloader CLI
+      - name: Build traced Sideloader CLI
         shell: pwsh
         run: |
           Push-Location "$env:SIDELOADER_DIR"
-          dub build -b release-debug --compiler=ldc2 :cli-frontend
+          dub build -b debug --compiler=ldc2 :cli-frontend
           Pop-Location
           if (-not (Test-Path "$env:SIDELOADER_DIR/bin/sideloader.exe")) { throw 'Missing sideloader.exe' }
 
@@ -147,6 +154,7 @@ jobs:
           $dist = Join-Path $PWD 'dist/Exp2011App-OneClick-Windows'
           New-Item -ItemType Directory -Force $dist | Out-Null
           Copy-Item "$env:SIDELOADER_DIR/bin/sideloader.exe" "$dist/sideloader.exe"
+          Get-ChildItem "$env:SIDELOADER_DIR" -Recurse -Filter 'sideloader.pdb' -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object { Copy-Item $_.FullName "$dist/sideloader.pdb" -Force }
           Copy-Item incoming/Exp2011App-unsigned.ipa "$dist/Exp2011App-unsigned.ipa"
           Copy-Item tools/windows/Install-Hello-App.cmd "$dist/Install-Hello-App.cmd"
           Copy-Item tools/windows/Install-Hello-App.ps1 "$dist/Install-Hello-App.ps1"
@@ -176,6 +184,8 @@ jobs:
           Exp2011App Hello Test - Windows installer bundle
           iOS source commit: $env:GITHUB_SHA
           Sideloader commit: $env:SIDELOADER_COMMIT
+          Provision commit: $env:PROVISION_COMMIT
+          LDC: 1.42.0 / debug traced build
           Start: double-click Install-Hello-App.cmd
           "@ | Set-Content "$dist/README-FIRST.txt"
 
@@ -238,7 +248,7 @@ jobs:
             release-assets/SHA256SUMS.txt \
             --target "$GITHUB_SHA" \
             --title "Hello iPhone Test ${GITHUB_RUN_NUMBER}" \
-            --notes $'End-to-end Hello iPhone sideload test.\n\nDownload `Exp2011App-OneClick-Windows.zip`, extract it, connect and unlock the iPhone, then double-click `Install-Hello-App.cmd`.\n\nThe Windows launcher is regression-tested under Windows PowerShell 5.1 for 0/1/N device handling and the packaged executables are smoke-tested before this Release is published.' \
+            --notes $'End-to-end Hello iPhone sideload test.\n\nThis build updates the Windows ADI runtime to Provision 7717ce1, LDC 1.42, a debug-capable traced Sideloader build, isolated provisioning state, and automatic Apple Devices startup.\n\nDownload `Exp2011App-OneClick-Windows.zip`, extract it, connect and unlock the iPhone, then double-click `Install-Hello-App.cmd`.' \
             --latest
 
   report-status:
