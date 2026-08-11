@@ -14,13 +14,19 @@ function Stop-Friendly([string]$Message, [int]$Code = 1) {
 
 function Get-ConnectedDevices {
     $tool = Join-Path $root 'idevice_id.exe'
-    if (-not (Test-Path $tool)) { return @() }
+    if (-not (Test-Path $tool)) { return }
     try {
         $lines = & $tool -l 2>$null
-        return @($lines | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        $lines | ForEach-Object { $_.Trim() } | Where-Object { $_ }
     } catch {
-        return @()
+        return
     }
+}
+
+function Get-ConnectedDeviceArray {
+    # PowerShell unwraps a one-item pipeline result to a scalar. Always wrap the
+    # result here so .Count and [0] behave identically for 0, 1, or N devices.
+    return @(Get-ConnectedDevices)
 }
 
 function Install-AppleDeviceSupport {
@@ -44,7 +50,7 @@ function Install-AppleDeviceSupport {
         }
     }
 
-    $devices = Get-ConnectedDevices
+    $devices = @(Get-ConnectedDeviceArray)
     if ($devices.Count -eq 0) {
         Write-Host "Opening the official Apple Devices Microsoft Store page..." -ForegroundColor Cyan
         Start-Process "ms-windows-store://pdp/?ProductId=$appleDevicesStoreId"
@@ -89,7 +95,7 @@ function Ensure-DeveloperMode([string]$Udid) {
 
 Write-Host ""
 Write-Host "============================================================"
-Write-Host " Exp2011App - Hello iPhone sideload test"
+Write-Host " Exp2011App - iPhone installer"
 Write-Host "============================================================"
 Write-Host ""
 Write-Host "This package signs the unsigned GitHub-built IPA with YOUR Apple"
@@ -111,18 +117,18 @@ foreach ($name in $required) {
 }
 
 Write-Host "Connect the iPhone by USB, unlock it, and leave it unlocked." -ForegroundColor Cyan
-$devices = Get-ConnectedDevices
+$devices = @(Get-ConnectedDeviceArray)
 if ($devices.Count -eq 0) {
     Install-AppleDeviceSupport
     Start-Sleep -Seconds 2
-    $devices = Get-ConnectedDevices
+    $devices = @(Get-ConnectedDeviceArray)
 }
 
 if ($devices.Count -eq 0) {
     Write-Host "No iPhone is visible yet." -ForegroundColor Yellow
     Write-Host "Reconnect USB, unlock the phone, and tap Trust if iOS asks."
     Read-Host "Press Enter to retry detection" | Out-Null
-    $devices = Get-ConnectedDevices
+    $devices = @(Get-ConnectedDeviceArray)
 }
 
 if ($devices.Count -eq 0) {
@@ -135,7 +141,7 @@ if ($devices.Count -gt 1) {
     Stop-Friendly "For this first test, connect only the iPhone you want to install to."
 }
 
-$udid = $devices[0]
+$udid = [string]$devices[0]
 Write-Host "Detected iPhone: $udid" -ForegroundColor Green
 Write-Host "Checking trust/pairing..."
 
