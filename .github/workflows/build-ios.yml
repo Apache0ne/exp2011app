@@ -15,6 +15,7 @@ env:
 
 jobs:
   build-ios:
+    if: github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[skip release-status]')
     runs-on: macos-15
 
     steps:
@@ -244,3 +245,48 @@ jobs:
             --title "Hello iPhone Test ${GITHUB_RUN_NUMBER}" \
             --notes "$NOTES" \
             --latest
+
+  report-status:
+    needs:
+      - build-ios
+      - build-windows-installer
+      - release
+    if: always() && (github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[skip release-status]'))
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      IOS_RESULT: ${{ needs.build-ios.result }}
+      WINDOWS_RESULT: ${{ needs.build-windows-installer.result }}
+      RELEASE_RESULT: ${{ needs.release.result }}
+
+    steps:
+      - name: Write build-status.json to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_number "$GITHUB_RUN_NUMBER" \
+            --arg source_sha "$GITHUB_SHA" \
+            --arg ios "$IOS_RESULT" \
+            --arg windows "$WINDOWS_RESULT" \
+            --arg release "$RELEASE_RESULT" \
+            --arg run_url "https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{run_id:$run_id,run_number:$run_number,source_sha:$source_sha,build_ios:$ios,build_windows_installer:$windows,release:$release,run_url:$run_url}' \
+            > /tmp/build-status.json
+
+          CONTENT="$(base64 -w0 /tmp/build-status.json)"
+          OLD_SHA="$(gh api "repos/$GITHUB_REPOSITORY/contents/build-status.json?ref=main" --jq .sha 2>/dev/null || true)"
+          if [[ -n "$OLD_SHA" ]]; then
+            gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/build-status.json" \
+              -f message='Update build status [skip release-status]' \
+              -f content="$CONTENT" \
+              -f sha="$OLD_SHA" \
+              -f branch='main' >/dev/null
+          else
+            gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/build-status.json" \
+              -f message='Update build status [skip release-status]' \
+              -f content="$CONTENT" \
+              -f branch='main' >/dev/null
+          fi
+          cat /tmp/build-status.json
