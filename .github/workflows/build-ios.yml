@@ -62,8 +62,9 @@ jobs:
           function Mock-OneDevice { '00000000-MOCK-IPHONE' }
           $devices = @(Mock-OneDevice)
           if ($devices.Count -ne 1 -or $devices[0] -ne '00000000-MOCK-IPHONE') { throw 'One-device regression' }
-          $bad = @(Select-String $launcher '^\s*\$devices\s*=.*Get-ConnectedDevice' | Where-Object { $_.Line -notmatch '^\s*\$devices\s*=\s*@\(' })
-          if ($bad.Count) { throw 'Found unwrapped device assignment' }
+          $matches = @(Select-String -Path $launcher -Pattern '^\s*\$devices\s*=.*Get-ConnectedDevice')
+          $bad = @($matches | Where-Object { $_.Line -notmatch '^\s*\$devices\s*=\s*@\(' })
+          if ($bad.Count) { $bad | ForEach-Object { Write-Host $_.Line }; throw 'Found unwrapped device assignment' }
           Write-Host 'PowerShell 5.1 launcher regression PASS'
 
       - uses: actions/download-artifact@v4
@@ -71,8 +72,8 @@ jobs:
           name: Exp2011App-unsigned-ipa
           path: incoming
 
-      # 1.33 is deliberate: Sideloader's Botan 1.13.6 still uses D syntax rejected by
-      # current LDC, while this compiler is already proven to build this codebase.
+      # Botan 1.13.6 in Sideloader uses D syntax rejected by current LDC.
+      # 1.33 is the known-good compiler for this dependency stack.
       - name: Set up compatible LDC
         uses: dlang-community/setup-dlang@v1
         with:
@@ -99,8 +100,8 @@ jobs:
           Pop-Location
           if (-not (Test-Path "$env:SIDELOADER_DIR/bin/sideloader.exe")) { throw 'Missing sideloader.exe' }
 
-      # This executes the same Apple Music/CoreADI provisioning that crashed on the
-      # physical PC, but requires neither an iPhone nor Apple-account credentials.
+      # This is the same Apple Music/CoreADI initialization and provisioning that
+      # crashed on the physical Windows PC, but it needs no iPhone or Apple login.
       - name: Real Windows CoreADI provisioning preflight
         shell: powershell
         run: |
