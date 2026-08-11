@@ -1,4 +1,4 @@
-name: Build iOS IPA
+name: Build + Release iPhone Hello Test
 
 on:
   push:
@@ -6,8 +6,15 @@ on:
       - main
   workflow_dispatch:
 
+permissions:
+  contents: write
+
+env:
+  SIDELOADER_COMMIT: a589cf11a3ac7c1c26b2f18aa5acdc8afb6dc915
+  LIBIMOBILEDEVICE_WINDOWS_TAG: v20260809-74585f8
+
 jobs:
-  build:
+  build-ios:
     runs-on: macos-15
 
     steps:
@@ -18,6 +25,8 @@ jobs:
         run: xcodebuild -version
 
       - name: Install XcodeGen
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
         run: brew install xcodegen
 
       - name: Generate Xcode project
@@ -48,6 +57,7 @@ jobs:
           cp -R "$APP_PATH" Payload/
           /usr/bin/zip -qry Exp2011App-unsigned.ipa Payload
           unzip -l Exp2011App-unsigned.ipa
+          shasum -a 256 Exp2011App-unsigned.ipa
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
@@ -56,3 +66,181 @@ jobs:
           path: Exp2011App-unsigned.ipa
           if-no-files-found: error
           retention-days: 30
+
+  build-windows-installer:
+    needs: build-ios
+    runs-on: windows-2022
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download built IPA
+        uses: actions/download-artifact@v4
+        with:
+          name: Exp2011App-unsigned-ipa
+          path: incoming
+
+      - name: Set up D compiler
+        uses: dlang-community/setup-dlang@v1
+        with:
+          compiler: ldc-1.33.0
+
+      - name: Download pinned open-source Sideloader source
+        shell: pwsh
+        run: |
+          $url = "https://github.com/Dadoum/Sideloader/archive/$env:SIDELOADER_COMMIT.zip"
+          Invoke-WebRequest -Uri $url -OutFile Sideloader-source.zip
+          Expand-Archive Sideloader-source.zip -DestinationPath sideloader-src
+          $dir = Get-ChildItem sideloader-src -Directory | Select-Object -First 1
+          if (-not $dir) { throw "Sideloader source archive did not extract" }
+          "SIDELOADER_DIR=$($dir.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Apply Windows usability patch
+        shell: pwsh
+        run: python tools/sideloader/patch_sideloader.py "$env:SIDELOADER_DIR"
+
+      - name: Build Sideloader CLI from source
+        shell: pwsh
+        run: |
+          Push-Location "$env:SIDELOADER_DIR"
+          dub build -b release-debug --compiler=ldc2 :cli-frontend
+          Pop-Location
+          if (-not (Test-Path "$env:SIDELOADER_DIR/bin/sideloader.exe")) {
+            throw "Sideloader build completed without bin/sideloader.exe"
+          }
+
+      - name: Download current Windows iPhone device runtime
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force device-runtime | Out-Null
+          gh release download "$env:LIBIMOBILEDEVICE_WINDOWS_TAG" `
+            --repo jrjr/libimobiledevice-windows `
+            --pattern "libimobile-suite-latest_w64.zip" `
+            --dir device-runtime
+          Expand-Archive device-runtime/libimobile-suite-latest_w64.zip -DestinationPath device-runtime/extracted
+
+      - name: Assemble self-contained Windows package
+        shell: pwsh
+        run: |
+          $dist = Join-Path $PWD 'dist/Exp2011App-OneClick-Windows'
+          New-Item -ItemType Directory -Force $dist | Out-Null
+
+          Copy-Item "$env:SIDELOADER_DIR/bin/sideloader.exe" "$dist/sideloader.exe"
+          Copy-Item "incoming/Exp2011App-unsigned.ipa" "$dist/Exp2011App-unsigned.ipa"
+          Copy-Item "tools/windows/Install-Hello-App.cmd" "$dist/Install-Hello-App.cmd"
+          Copy-Item "tools/windows/Install-Hello-App.ps1" "$dist/Install-Hello-App.ps1"
+          Copy-Item "Sideloader-source.zip" "$dist/Sideloader-source-$env:SIDELOADER_COMMIT.zip"
+          Copy-Item "device-runtime/extracted/*" $dist -Recurse -Force
+
+          function Copy-DllAlias([string[]]$patterns, [string]$alias) {
+            foreach ($pattern in $patterns) {
+              $hit = Get-ChildItem $dist -File -Filter $pattern | Select-Object -First 1
+              if ($hit) {
+                Copy-Item $hit.FullName (Join-Path $dist $alias) -Force
+                Write-Host "Alias $alias -> $($hit.Name)"
+                return
+              }
+            }
+            throw "Could not create $alias; none of these patterns existed: $($patterns -join ', ')"
+          }
+
+          Copy-DllAlias @('libimobiledevice-1.0*.dll','libimobiledevice*.dll') 'imobiledevice.dll'
+          Copy-DllAlias @('libplist-2.0*.dll','libplist*.dll') 'plist.dll'
+          Copy-DllAlias @('libusbmuxd-2.0*.dll','libusbmuxd*.dll') 'usbmuxd.dll'
+
+          if ($env:VCToolsRedistDir) {
+            $crt = Join-Path $env:VCToolsRedistDir 'x64/Microsoft.VC143.CRT'
+            if (Test-Path $crt) {
+              Copy-Item "$crt/*.dll" $dist -Force
+            }
+          }
+
+          @"
+          Exp2011App Hello Test - Windows installer bundle
+
+          iOS app source: this repository / current commit $env:GITHUB_SHA
+          Sideloader source: https://github.com/Dadoum/Sideloader/tree/$env:SIDELOADER_COMMIT
+          Sideloader license: GPL-3.0 (source archive included in this bundle)
+          Device runtime: https://github.com/jrjr/libimobiledevice-windows/releases/tag/$env:LIBIMOBILEDEVICE_WINDOWS_TAG
+
+          Start: double-click Install-Hello-App.cmd
+          "@ | Set-Content "$dist/README-FIRST.txt"
+
+          $required = @('sideloader.exe','Exp2011App-unsigned.ipa','idevice_id.exe','idevicepair.exe','imobiledevice.dll','plist.dll','usbmuxd.dll')
+          foreach ($name in $required) {
+            if (-not (Test-Path (Join-Path $dist $name))) { throw "Missing required packaged file: $name" }
+          }
+
+          Compress-Archive -Path "$dist/*" -DestinationPath "Exp2011App-OneClick-Windows.zip" -CompressionLevel Optimal
+          Get-FileHash Exp2011App-OneClick-Windows.zip -Algorithm SHA256
+
+      - name: Upload Windows installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Exp2011App-OneClick-Windows
+          path: Exp2011App-OneClick-Windows.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    needs:
+      - build-ios
+      - build-windows-installer
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download IPA
+        uses: actions/download-artifact@v4
+        with:
+          name: Exp2011App-unsigned-ipa
+          path: release-assets
+
+      - name: Download Windows bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: Exp2011App-OneClick-Windows
+          path: release-assets
+
+      - name: Create checksums
+        run: |
+          cd release-assets
+          sha256sum Exp2011App-unsigned.ipa Exp2011App-OneClick-Windows.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="hello-build-${GITHUB_RUN_NUMBER}"
+          NOTES="$(cat <<'TXT'
+          First end-to-end Hello iPhone test.
+
+          Windows first-time path:
+          1. Download `Exp2011App-OneClick-Windows.zip`.
+          2. Extract it.
+          3. Connect + unlock the iPhone and tap Trust if prompted.
+          4. Double-click `Install-Hello-App.cmd`.
+          5. Enter the Apple development-account credentials/2FA requested by the open-source Sideloader.
+          6. Look for `exp2011app` on the phone.
+
+          The raw `Exp2011App-unsigned.ipa` is also attached. Once an on-device sideload manager such as SideStore is bootstrapped, that IPA is the file you can download directly from this Releases page on the iPhone and import there.
+
+          No MLX/model code is included yet. This release exists only to prove build -> release -> signing -> physical iPhone installation.
+          TXT
+          )"
+          gh release create "$TAG" \
+            release-assets/Exp2011App-unsigned.ipa \
+            release-assets/Exp2011App-OneClick-Windows.zip \
+            release-assets/SHA256SUMS.txt \
+            --target "$GITHUB_SHA" \
+            --title "Hello iPhone Test ${GITHUB_RUN_NUMBER}" \
+            --notes "$NOTES" \
+            --latest
