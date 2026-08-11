@@ -1,9 +1,9 @@
 {
-  "run_id": "31467648406",
-  "run_number": "18",
-  "source_sha": "1bc1930d6c636fc2b104983c370e2ffd9d28531f",
+  "run_id": "31470262481",
+  "run_number": "21",
+  "source_sha": "b370e8278ebc6223df94c67666f19a51ec8bcfd4",
   "build_ios": "success",
-  "build_windows_installer": "success",
-  "release": "success",
-  "run_url": "https://github.com/Apache0ne/exp2011app/actions/runs/31467648406"
+  "build_windows_installer": "failure",
+  "release": "skipped",
+  "run_url": "https://github.com/Apache0ne/exp2011app/actions/runs/31470262481"
 }
