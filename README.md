@@ -13,7 +13,7 @@ No MLX, model download, networking, image editing, database, analytics, or other
 
 ## Easiest first install from a GitHub Release
 
-Open this repository's **Releases** page on the Windows PC and download the newest:
+Open this repository's **Releases** page on the Windows PC and use the release marked **Latest**. Download:
 
 `Exp2011App-OneClick-Windows.zip`
 
