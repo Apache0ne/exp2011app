@@ -9,8 +9,10 @@ permissions:
   contents: write
 
 env:
+  SIDELOADER_REPO: https://github.com/Dadoum/Sideloader.git
   SIDELOADER_COMMIT: a589cf11a3ac7c1c26b2f18aa5acdc8afb6dc915
-  PROVISION_COMMIT: 7717ce1f7b3c9779fe9982005d07b6665071a239
+  PROVISION_COMMIT: 645d56d8e8c86c057893321843db00b21f1aaeb2
+  D_COMPILER: ldc-1.34.0
   LIBIMOBILEDEVICE_WINDOWS_TAG: v20260809-74585f8
 
 jobs:
@@ -43,8 +45,129 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  # Match Dadoum/Sideloader's own Windows CI path instead of compiling the
+  # SysV<->MSVC CoreADI bridge natively on Windows with a different LDC.
+  build-sideloader-windows:
+    if: github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[skip release-status]')
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Dadoum-compatible LDC
+        uses: dlang-community/setup-dlang@v1
+        with:
+          compiler: ${{ env.D_COMPILER }}
+
+      - name: Install Windows cross-target dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y clang lld p7zip-full
+          ldc2 --version
+          dub --version
+
+      - name: Fetch exact Sideloader source and apply local UI/trace patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone "$SIDELOADER_REPO" sideloader-src
+          git -C sideloader-src checkout --detach "$SIDELOADER_COMMIT"
+          test "$(git -C sideloader-src rev-parse HEAD)" = "$SIDELOADER_COMMIT"
+          python3 tools/sideloader/patch_sideloader.py sideloader-src
+
+      # This is copied from Dadoum/Sideloader's x86_64-windows-msvc setup.
+      # It is important for Provision/CoreADI because that code crosses the
+      # Windows x64 and SysV x86-64 ABIs.
+      - name: Configure Dadoum x86_64-windows-msvc target
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ldc
+          cat > ~/.ldc/ldc2.conf <<'EOF'
+          default:
+          {
+              switches = [
+                  "-link-defaultlib-shared=false",
+                  "-linker=lld-link"
+              ];
+          };
+
+          "x86_64-.*-windows-msvc":
+          {
+              switches = [
+                  "-link-defaultlib-shared=false",
+                  "-linker=lld-link",
+                  "-L/alternatename:__security_check_cookie=__security_check_cookie_default",
+                  "-L/alternatename:__security_cookie=__security_cookie_default"
+              ];
+              lib-dirs = [
+                  "%%ldcbinarypath%%/../lib",
+                  "%%ldcbinarypath%%/../lib/windows/x86_64"
+              ];
+              rpath = "";
+          };
+          EOF
+
+          LDC_VERSION=$(ldc2 --version | head -1 | sed -E 's/.*LDC - the LLVM D compiler \(([0-9.]+).*/\1/')
+          test "$LDC_VERSION" = "1.34.0"
+          mkdir -p /tmp/ldc-win
+          wget -q "https://github.com/ldc-developers/ldc/releases/download/v${LDC_VERSION}/ldc2-${LDC_VERSION}-windows-multilib.7z" -O /tmp/ldc-win/ldc.7z
+          7z x /tmp/ldc-win/ldc.7z -o/tmp/ldc-win > /dev/null
+          cp -r /tmp/ldc-win/ldc2-${LDC_VERSION}-windows-multilib/lib/* "$(dirname "$(which ldc2)")/../lib/"
+
+      - name: Build Sideloader exactly for x86_64-windows-msvc
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd sideloader-src
+          dub build -b release-debug --compiler=ldc2 --arch x86_64-windows-msvc :cli-frontend
+          test -f bin/sideloader.exe
+          file bin/sideloader.exe
+          sha256sum bin/sideloader.exe
+
+      - name: Package cross-built Sideloader and corresponding source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p sideloader-dist
+          cp sideloader-src/bin/sideloader.exe sideloader-dist/
+          if [[ -f sideloader-src/bin/sideloader.pdb ]]; then cp sideloader-src/bin/sideloader.pdb sideloader-dist/; fi
+          cat > sideloader-dist/sideloader-build-metadata.txt <<EOF
+          Sideloader commit: $SIDELOADER_COMMIT
+          Provision commit: $PROVISION_COMMIT
+          LDC: 1.34.0
+          Host: ubuntu-22.04
+          Target: x86_64-windows-msvc
+          Build: release-debug
+          Local source patches: hidden Windows password input + provisioning stage markers only
+          EOF
+          python3 - <<'PY'
+          from pathlib import Path
+          import zipfile
+
+          root = Path('sideloader-src')
+          out = Path('sideloader-dist/Sideloader-source.zip')
+          excluded = {'.git', '.dub', 'bin'}
+          with zipfile.ZipFile(out, 'w', compression=zipfile.ZIP_DEFLATED) as z:
+              for path in root.rglob('*'):
+                  rel = path.relative_to(root)
+                  if any(part in excluded for part in rel.parts):
+                      continue
+                  if path.is_file():
+                      z.write(path, Path('Sideloader-source') / rel)
+          PY
+          sha256sum sideloader-dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sideloader-windows-msvc
+          path: sideloader-dist/
+          if-no-files-found: error
+          retention-days: 30
+
   build-windows-installer:
-    needs: build-ios
+    needs: [build-ios, build-sideloader-windows]
     runs-on: windows-2022
     env:
       GH_TOKEN: ${{ github.token }}
@@ -72,36 +195,25 @@ jobs:
           name: Exp2011App-unsigned-ipa
           path: incoming
 
-      # Botan 1.13.6 in Sideloader uses D syntax rejected by current LDC.
-      # 1.33 is the known-good compiler for this dependency stack.
-      - name: Set up compatible LDC
-        uses: dlang-community/setup-dlang@v1
+      - uses: actions/download-artifact@v4
         with:
-          compiler: ldc-1.33.0
+          name: sideloader-windows-msvc
+          path: sideloader-dist
 
-      - name: Fetch and patch Sideloader
-        shell: pwsh
+      - name: Verify Dadoum-parity Sideloader artifact
+        shell: powershell
         run: |
-          Invoke-WebRequest "https://github.com/Dadoum/Sideloader/archive/$env:SIDELOADER_COMMIT.zip" -OutFile Sideloader-source.zip
-          Expand-Archive Sideloader-source.zip sideloader-src
-          $dir = Get-ChildItem sideloader-src -Directory | Select-Object -First 1
-          if (-not $dir) { throw 'Sideloader source did not extract' }
-          "SIDELOADER_DIR=$($dir.FullName)" | Out-File $env:GITHUB_ENV -Append
-          python tools/sideloader/patch_sideloader.py "$($dir.FullName)"
-          $dub = Get-Content "$($dir.FullName)/dub.json" -Raw | ConvertFrom-Json
-          if ($dub.dependencies.provision.version -ne $env:PROVISION_COMMIT) { throw 'Provision pin mismatch' }
-          ldc2 --version
+          $exe = Join-Path $PWD 'sideloader-dist/sideloader.exe'
+          $metadata = Join-Path $PWD 'sideloader-dist/sideloader-build-metadata.txt'
+          if (-not (Test-Path $exe)) { throw 'Missing cross-built sideloader.exe' }
+          if (-not (Test-Path $metadata)) { throw 'Missing Sideloader build metadata' }
+          Get-Content $metadata | ForEach-Object { Write-Host $_ }
+          & $exe version
+          if ($LASTEXITCODE) { throw 'Cross-built sideloader.exe did not start on Windows' }
 
-      - name: Build traced Sideloader
-        shell: pwsh
-        run: |
-          Push-Location $env:SIDELOADER_DIR
-          dub build -b debug --compiler=ldc2 :cli-frontend
-          Pop-Location
-          if (-not (Test-Path "$env:SIDELOADER_DIR/bin/sideloader.exe")) { throw 'Missing sideloader.exe' }
-
-      # This is the same Apple Music/CoreADI initialization and provisioning that
-      # crashed on the physical Windows PC, but it needs no iPhone or Apple login.
+      # Execute the exact cross-built binary on Windows. This is the same
+      # Apple Music/CoreADI initialization/provisioning path that crashed on
+      # the physical PC, but it needs no iPhone or Apple login.
       - name: Real Windows CoreADI provisioning preflight
         shell: powershell
         run: |
@@ -110,8 +222,8 @@ jobs:
           Remove-Item $preflight -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force $preflight | Out-Null
           $env:SIDELOADER_CONFIG_DIR = $preflight
-          Push-Location $env:SIDELOADER_DIR
-          $lines = @(& .\bin\sideloader.exe -d team list 2>&1)
+          Push-Location (Join-Path $PWD 'sideloader-dist')
+          $lines = @(& .\sideloader.exe -d team list 2>&1)
           $code = $LASTEXITCODE
           Pop-Location
           $lines | ForEach-Object { Write-Host $_ }
@@ -136,11 +248,12 @@ jobs:
         run: |
           $dist = Join-Path $PWD 'dist/Exp2011App-OneClick-Windows'
           New-Item -ItemType Directory -Force $dist | Out-Null
-          Copy-Item "$env:SIDELOADER_DIR/bin/sideloader.exe" "$dist/sideloader.exe"
-          Get-ChildItem $env:SIDELOADER_DIR -Recurse -Filter sideloader.pdb -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object { Copy-Item $_.FullName "$dist/sideloader.pdb" }
+          Copy-Item 'sideloader-dist/sideloader.exe' "$dist/sideloader.exe"
+          if (Test-Path 'sideloader-dist/sideloader.pdb') { Copy-Item 'sideloader-dist/sideloader.pdb' "$dist/sideloader.pdb" }
+          Copy-Item 'sideloader-dist/sideloader-build-metadata.txt' "$dist/sideloader-build-metadata.txt"
+          Copy-Item 'sideloader-dist/Sideloader-source.zip' "$dist/Sideloader-source-$env:SIDELOADER_COMMIT.zip"
           Copy-Item incoming/Exp2011App-unsigned.ipa "$dist/Exp2011App-unsigned.ipa"
           Copy-Item tools/windows/Install-Hello-App.* $dist
-          Copy-Item Sideloader-source.zip "$dist/Sideloader-source-$env:SIDELOADER_COMMIT.zip"
           Copy-Item 'device-runtime/extracted/*' $dist -Recurse -Force
 
           function Alias-Dll([string[]]$patterns,[string]$name) {
@@ -162,13 +275,15 @@ jobs:
           Exp2011App Hello Test
           iOS source: $env:GITHUB_SHA
           Sideloader: $env:SIDELOADER_COMMIT
-          Provision: $env:PROVISION_COMMIT
-          LDC: 1.33.0 debug/trace
+          Provision: $env:PROVISION_COMMIT (upstream Sideloader pin)
+          LDC: 1.34.0 release-debug
+          Build host: ubuntu-22.04
+          Target: x86_64-windows-msvc
           GitHub Windows CoreADI provisioning preflight: PASS
           Run: Install-Hello-App.cmd
           "@ | Set-Content "$dist/README-FIRST.txt"
 
-          $required = @('sideloader.exe','Exp2011App-unsigned.ipa','Install-Hello-App.cmd','Install-Hello-App.ps1','idevice_id.exe','idevicepair.exe','idevicedevmodectl.exe','imobiledevice.dll','plist.dll','usbmuxd.dll')
+          $required = @('sideloader.exe','sideloader-build-metadata.txt','Exp2011App-unsigned.ipa','Install-Hello-App.cmd','Install-Hello-App.ps1','idevice_id.exe','idevicepair.exe','idevicedevmodectl.exe','imobiledevice.dll','plist.dll','usbmuxd.dll')
           foreach ($f in $required) { if (-not (Test-Path (Join-Path $dist $f))) { throw "Missing $f" } }
           Push-Location $dist
           & .\sideloader.exe version; if ($LASTEXITCODE) { throw 'sideloader smoke test failed' }
@@ -210,15 +325,16 @@ jobs:
           gh release create "hello-build-${GITHUB_RUN_NUMBER}" \
             release-assets/Exp2011App-unsigned.ipa release-assets/Exp2011App-OneClick-Windows.zip release-assets/SHA256SUMS.txt \
             --target "$GITHUB_SHA" --title "Hello iPhone Test ${GITHUB_RUN_NUMBER}" --latest \
-            --notes $'Windows one-click Hello iPhone test.\n\nThis Release is published only after a GitHub Windows runner completes fresh Apple Music/CoreADI provisioning without a native crash. The launcher also auto-starts Apple Devices, uses isolated ADI state, and runs Sideloader with trace logging.'
+            --notes $'Windows one-click Hello iPhone test.\n\nThis Release is published only after Dadoum/Sideloader is cross-built with its Windows x86_64-msvc toolchain, then that exact executable completes fresh Apple Music/CoreADI provisioning on a GitHub Windows runner without a native crash.'
 
   report-status:
-    needs: [build-ios, build-windows-installer, release]
+    needs: [build-ios, build-sideloader-windows, build-windows-installer, release]
     if: always() && (github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[skip release-status]'))
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
       IOS_RESULT: ${{ needs.build-ios.result }}
+      SIDELOADER_RESULT: ${{ needs.build-sideloader-windows.result }}
       WINDOWS_RESULT: ${{ needs.build-windows-installer.result }}
       RELEASE_RESULT: ${{ needs.release.result }}
     steps:
@@ -227,9 +343,9 @@ jobs:
         run: |
           set -euo pipefail
           jq -n --arg run_id "$GITHUB_RUN_ID" --arg run_number "$GITHUB_RUN_NUMBER" --arg source_sha "$GITHUB_SHA" \
-            --arg ios "$IOS_RESULT" --arg windows "$WINDOWS_RESULT" --arg release "$RELEASE_RESULT" \
+            --arg ios "$IOS_RESULT" --arg sideloader "$SIDELOADER_RESULT" --arg windows "$WINDOWS_RESULT" --arg release "$RELEASE_RESULT" \
             --arg run_url "https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-            '{run_id:$run_id,run_number:$run_number,source_sha:$source_sha,build_ios:$ios,build_windows_installer:$windows,release:$release,run_url:$run_url}' > /tmp/status.json
+            '{run_id:$run_id,run_number:$run_number,source_sha:$source_sha,build_ios:$ios,build_sideloader_windows:$sideloader,build_windows_installer:$windows,release:$release,run_url:$run_url}' > /tmp/status.json
           CONTENT="$(base64 -w0 /tmp/status.json)"
           OLD_SHA="$(gh api "repos/$GITHUB_REPOSITORY/contents/build-status.json?ref=main" --jq .sha 2>/dev/null || true)"
           if [[ -n "$OLD_SHA" ]]; then

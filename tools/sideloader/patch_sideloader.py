@@ -4,7 +4,8 @@ import json
 import pathlib
 import sys
 
-PROVISION_COMMIT = "7717ce1f7b3c9779fe9982005d07b6665071a239"
+EXPECTED_PROVISION_COMMIT = "645d56d8e8c86c057893321843db00b21f1aaeb2"
+EXPECTED_PROVISION_REPOSITORY = "git+https://github.com/Dadoum/Provision.git"
 
 
 def replace_once(text: str, old: str, new: str, label: str) -> str:
@@ -12,6 +13,39 @@ def replace_once(text: str, old: str, new: str, label: str) -> str:
     if count != 1:
         raise RuntimeError(f"{label}: expected exactly one match, found {count}")
     return text.replace(old, new, 1)
+
+
+def verify_provision_pin(root: pathlib.Path) -> None:
+    checks = (
+        (root / "dub.json", ("dependencies", "provision")),
+        (root / "dub.selections.json", ("versions", "provision")),
+    )
+
+    for path, keys in checks:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        value = payload
+        for key in keys:
+            value = value[key]
+        if not isinstance(value, dict):
+            raise RuntimeError(f"{path}: Provision entry is not a pinned repository dependency")
+
+        version = value.get("version")
+        repository = value.get("repository")
+        if version != EXPECTED_PROVISION_COMMIT:
+            raise RuntimeError(
+                f"{path}: upstream Provision pin changed: {version!r}; "
+                f"expected {EXPECTED_PROVISION_COMMIT}"
+            )
+        if repository != EXPECTED_PROVISION_REPOSITORY:
+            raise RuntimeError(
+                f"{path}: upstream Provision repository changed: {repository!r}; "
+                f"expected {EXPECTED_PROVISION_REPOSITORY!r}"
+            )
+
+    print(
+        "Verified Dadoum/Sideloader upstream Provision pin: "
+        f"{EXPECTED_PROVISION_COMMIT}"
+    )
 
 
 def patch_hidden_password(root: pathlib.Path) -> None:
@@ -58,32 +92,9 @@ def patch_hidden_password(root: pathlib.Path) -> None:
     print(f"Patched hidden password input: {cli}")
 
 
-def patch_provision_pin(root: pathlib.Path) -> None:
-    dub_json = root / "dub.json"
-    dub = json.loads(dub_json.read_text(encoding="utf-8"))
-    provision = dub["dependencies"]["provision"]
-    old = provision.get("version")
-    provision["version"] = PROVISION_COMMIT
-    dub_json.write_text(json.dumps(dub, indent=4) + "\n", encoding="utf-8")
-    print(f"Provision dependency: {old} -> {PROVISION_COMMIT}")
-
-    selections_path = root / "dub.selections.json"
-    selections = json.loads(selections_path.read_text(encoding="utf-8"))
-    selected = selections["versions"]["provision"]
-    if isinstance(selected, dict):
-        selected["version"] = PROVISION_COMMIT
-    else:
-        selections["versions"]["provision"] = {
-            "version": PROVISION_COMMIT,
-            "repository": "git+https://github.com/Dadoum/Provision.git",
-        }
-    selections_path.write_text(json.dumps(selections, indent=4) + "\n", encoding="utf-8")
-    print(f"Pinned dub selection to Provision {PROVISION_COMMIT}")
-
-
 def patch_stage_markers(root: pathlib.Path) -> None:
-    # These INFO markers survive even if the native Android library access-violates,
-    # allowing a physical Windows/iPhone run to identify the exact phase reached.
+    # INFO markers identify the exact native provisioning phase reached without
+    # changing the Provision dependency or the CoreADI ABI implementation.
     app_file = root / "source" / "app" / "package.d"
     text = app_file.read_text(encoding="utf-8")
     old = '''        log.info("Provisioning device...");\n\n        ProvisioningSession provisioningSession = new ProvisioningSession(adi, device);\n        provisioningSession.provision(-2);\n        log.info("Device provisioned successfully.");'''
@@ -98,9 +109,14 @@ def main() -> None:
         raise SystemExit("usage: patch_sideloader.py <Sideloader source root>")
 
     root = pathlib.Path(sys.argv[1]).resolve()
+
+    # Do not rewrite Dadoum's dependency graph. The native CoreADI bridge is
+    # sensitive to the exact source/toolchain combination, so fail if upstream
+    # no longer matches the revision we audited.
+    verify_provision_pin(root)
     patch_hidden_password(root)
-    patch_provision_pin(root)
     patch_stage_markers(root)
+    verify_provision_pin(root)
 
 
 if __name__ == "__main__":

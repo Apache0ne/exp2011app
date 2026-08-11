@@ -32,7 +32,28 @@ A free Apple developer identity is enough for this test. Free provisioning norma
 
 The Windows launcher is regression-tested under Windows PowerShell 5.1, including the exact **one connected iPhone** case that previously caused scalar `.Count` failures.
 
-The Release is also blocked until a GitHub **Windows** runner executes the same Apple Music/CoreADI provisioning path used by Sideloader, successfully provisions a fresh ADI identity, and reaches the login stage without a native Windows access violation. This allows us to catch provisioning crashes before using a physical iPhone as the test machine.
+The Release is blocked until a GitHub **Windows** runner executes the same Apple Music/CoreADI provisioning path used by Sideloader, successfully provisions a fresh ADI identity, and reaches the login stage without a native Windows access violation. This catches provisioning crashes before using a physical iPhone as the test machine.
+
+## Sideloader build parity
+
+The Windows Sideloader executable is no longer compiled natively on the Windows runner. It now follows Dadoum/Sideloader's own Windows CI strategy for the audited source revision:
+
+- Sideloader commit: `a589cf11a3ac7c1c26b2f18aa5acdc8afb6dc915`
+- Provision commit: `645d56d8e8c86c057893321843db00b21f1aaeb2` — the pin already present in that Sideloader revision
+- compiler: `ldc-1.34.0`
+- build host: `ubuntu-22.04`
+- target: `x86_64-windows-msvc`
+- build mode: `release-debug`
+- linker/target setup: Dadoum's LDC Windows cross-target configuration, including the Windows multilib runtime
+
+This matters because Provision/CoreADI crosses the Windows x64 and SysV x86-64 ABIs. The previous pipeline changed both the Provision revision and compiler/build path while debugging an `0xC0000005` access violation.
+
+Our source patcher now **refuses to rewrite the Provision dependency**. It verifies Dadoum's exact upstream pin before and after applying only two local changes:
+
+1. hidden password input on Windows,
+2. diagnostic provisioning stage markers.
+
+The exact cross-built `sideloader.exe` is then downloaded by the Windows job and used for the live CoreADI preflight. The installer is not published unless that binary passes the preflight.
 
 ## What the release contains
 
@@ -40,9 +61,7 @@ The Release is also blocked until a GitHub **Windows** runner executes the same 
 - `Exp2011App-OneClick-Windows.zip` - Windows bootstrap package containing the IPA, Dadoum Sideloader built from pinned source, Windows libimobiledevice pairing/device tools and runtime, and the guided installer.
 - `SHA256SUMS.txt` - checksums for both downloads.
 
-The current Windows runtime uses the newer Provision source pinned by the build, a current LDC compiler, trace logging, and isolated ADI state so a failed older provisioning attempt cannot contaminate the next test.
-
-The Windows package also contains the exact Sideloader source ZIP used to build its binary. Sideloader is GPL-3.0 licensed; the device communication runtime comes from the open-source libimobiledevice ecosystem.
+The Windows package also contains `sideloader-build-metadata.txt` plus the exact patched Sideloader source ZIP corresponding to the executable. Sideloader is GPL-3.0 licensed; the device communication runtime comes from the open-source libimobiledevice ecosystem.
 
 ## Direct download on the iPhone later
 
@@ -58,12 +77,14 @@ Plain iOS does not install an arbitrary unsigned IPA merely by tapping the downl
 
 1. builds the native SwiftUI app for `iphoneos` with Xcode,
 2. packages the unsigned IPA,
-3. builds the traced Sideloader/Provision runtime on Windows,
-4. performs a fresh real Apple ADI provisioning preflight on that Windows runner,
-5. bundles the Windows libimobiledevice runtime and pairing tools,
-6. regression-tests the Windows launcher and smoke-tests the packaged executables,
-7. creates the Windows one-click ZIP,
-8. publishes the IPA, Windows ZIP and SHA256 checksums only after all gates pass,
-9. writes the final CI result to `build-status.json` on `main` so the exact release pipeline can be verified.
+3. cross-builds Sideloader on Ubuntu with LDC 1.34.0 for `x86_64-windows-msvc` using Dadoum's target configuration,
+4. verifies the upstream Provision pin instead of replacing it,
+5. transfers that exact Windows executable to a Windows runner,
+6. performs a fresh real Apple ADI/CoreADI provisioning preflight there,
+7. bundles the Windows libimobiledevice runtime and pairing tools,
+8. regression-tests the Windows launcher and smoke-tests the packaged executables,
+9. creates the Windows one-click ZIP,
+10. publishes the IPA, Windows ZIP and SHA256 checksums only after all gates pass,
+11. writes the final CI result to `build-status.json` on `main` so the exact release pipeline can be verified.
 
 All experimental project changes are committed directly to `main`; no PR/branch workflow is used for this test repository.
