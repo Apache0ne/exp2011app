@@ -30,7 +30,7 @@ Then:
 
 A free Apple developer identity is enough for this test. Free provisioning normally expires after 7 days, so the app has to be signed again after that.
 
-The Windows launcher is regression-tested under Windows PowerShell 5.1, including the exact **one connected iPhone** case that previously caused scalar `.Count` failures.
+The Windows launcher is regression-tested under Windows PowerShell 5.1, including the exact **one connected iPhone** case that previously caused scalar `.Count` failures. Releases are blocked if this regression test or the packaged Windows executable smoke tests fail.
 
 ## What the release contains
 
