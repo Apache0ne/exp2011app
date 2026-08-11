@@ -138,6 +138,38 @@ jobs:
           Pop-Location
           if (-not (Test-Path "$env:SIDELOADER_DIR/bin/sideloader.exe")) { throw 'Missing sideloader.exe' }
 
+      - name: Exercise real Apple ADI provisioning on Windows
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $preflight = Join-Path $env:RUNNER_TEMP 'exp2011app-adi-preflight'
+          Remove-Item $preflight -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force $preflight | Out-Null
+          $env:SIDELOADER_CONFIG_DIR = $preflight
+
+          Push-Location "$env:SIDELOADER_DIR"
+          $lines = @(& .\bin\sideloader.exe -d team list 2>&1)
+          $code = $LASTEXITCODE
+          Pop-Location
+
+          $lines | ForEach-Object { Write-Host $_ }
+          $text = $lines -join "`n"
+          Write-Host "ADI preflight exit code: $code"
+
+          if ($code -eq -1073741819) {
+            throw 'ADI preflight reproduced Windows access violation 0xC0000005. Blocking Release.'
+          }
+          if ($text -notmatch 'Device provisioned successfully\.|Provisioning OK\.') {
+            throw 'ADI preflight did not complete Apple ADI provisioning. Blocking Release.'
+          }
+          if ($text -notmatch 'Logging in\.\.\.') {
+            throw 'ADI preflight never reached the post-provisioning login stage. Blocking Release.'
+          }
+          if ($code -ne 1) {
+            throw "ADI preflight expected non-interactive login exit code 1 after successful provisioning; got $code"
+          }
+          Write-Host 'REAL WINDOWS ADI PREFLIGHT PASSED.' -ForegroundColor Green
+
       - name: Download Windows iPhone runtime
         shell: pwsh
         run: |
@@ -186,6 +218,7 @@ jobs:
           Sideloader commit: $env:SIDELOADER_COMMIT
           Provision commit: $env:PROVISION_COMMIT
           LDC: 1.42.0 / debug traced build
+          Windows ADI preflight: PASSED before packaging
           Start: double-click Install-Hello-App.cmd
           "@ | Set-Content "$dist/README-FIRST.txt"
 
@@ -248,7 +281,7 @@ jobs:
             release-assets/SHA256SUMS.txt \
             --target "$GITHUB_SHA" \
             --title "Hello iPhone Test ${GITHUB_RUN_NUMBER}" \
-            --notes $'End-to-end Hello iPhone sideload test.\n\nThis build updates the Windows ADI runtime to Provision 7717ce1, LDC 1.42, a debug-capable traced Sideloader build, isolated provisioning state, and automatic Apple Devices startup.\n\nDownload `Exp2011App-OneClick-Windows.zip`, extract it, connect and unlock the iPhone, then double-click `Install-Hello-App.cmd`.' \
+            --notes $'End-to-end Hello iPhone sideload test.\n\nThis build is released only after the GitHub Windows runner itself downloads Apple Music, initializes CoreADI, completes Apple ADI provisioning, and reaches the login stage without a native crash. It also uses Provision 7717ce1, LDC 1.42, isolated provisioning state, trace logging, and automatic Apple Devices startup.\n\nDownload `Exp2011App-OneClick-Windows.zip`, extract it, connect and unlock the iPhone, then double-click `Install-Hello-App.cmd`.' \
             --latest
 
   report-status:
