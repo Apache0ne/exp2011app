@@ -30,6 +30,8 @@ Then:
 
 A free Apple developer identity is enough for this test. Free provisioning normally expires after 7 days, so the app has to be signed again after that.
 
+The Windows launcher is regression-tested under Windows PowerShell 5.1, including the exact **one connected iPhone** case that previously caused scalar `.Count` failures.
+
 ## What the release contains
 
 - `Exp2011App-unsigned.ipa` - the real ARM64 `iphoneos` build made by Xcode on GitHub's macOS runner.
@@ -54,8 +56,9 @@ Plain iOS does not install an arbitrary unsigned IPA merely by tapping the downl
 2. packages the unsigned IPA,
 3. builds Dadoum Sideloader for Windows from a pinned open-source commit,
 4. bundles the Windows libimobiledevice runtime and pairing tools,
-5. creates the Windows one-click ZIP,
-6. publishes the IPA, Windows ZIP and SHA256 checksums to a new GitHub Release,
-7. writes the final CI result to `build-status.json` on `main` so the exact release pipeline can be verified.
+5. regression-tests the Windows launcher under Windows PowerShell 5.1 and smoke-tests the packaged executables,
+6. creates the Windows one-click ZIP,
+7. publishes the IPA, Windows ZIP and SHA256 checksums to a new GitHub Release,
+8. writes the final CI result to `build-status.json` on `main` so the exact release pipeline can be verified.
 
 All experimental project changes are committed directly to `main`; no PR/branch workflow is used for this test repository.
