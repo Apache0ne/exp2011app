@@ -2,8 +2,7 @@ name: Build + Release iPhone Hello Test
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -17,10 +16,8 @@ jobs:
   build-ios:
     if: github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[skip release-status]')
     runs-on: macos-15
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Show Xcode version
         run: xcodebuild -version
@@ -54,14 +51,13 @@ jobs:
           APP_PATH="build/Build/Products/Release-iphoneos/Exp2011App.app"
           test -d "$APP_PATH"
           rm -rf Payload
-          mkdir -p Payload
+          mkdir Payload
           cp -R "$APP_PATH" Payload/
           /usr/bin/zip -qry Exp2011App-unsigned.ipa Payload
           unzip -l Exp2011App-unsigned.ipa
           shasum -a 256 Exp2011App-unsigned.ipa
 
-      - name: Upload IPA artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: Exp2011App-unsigned-ipa
           path: Exp2011App-unsigned.ipa
@@ -73,10 +69,8 @@ jobs:
     runs-on: windows-2022
     env:
       GH_TOKEN: ${{ github.token }}
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Regression-test launcher in Windows PowerShell 5.1
         shell: powershell
@@ -86,33 +80,32 @@ jobs:
           $tokens = $null
           $parseErrors = $null
           [void][System.Management.Automation.Language.Parser]::ParseFile($launcher, [ref]$tokens, [ref]$parseErrors)
-          if ($parseErrors.Count -ne 0) {
+          if (@($parseErrors).Count -ne 0) {
             $parseErrors | Format-List | Out-String | Write-Host
             throw 'Install-Hello-App.ps1 has PowerShell syntax errors'
           }
 
-          # Reproduce the exact PowerShell behavior that caused the real one-iPhone failure.
+          # Exact regression: one pipeline result must still expose Count=1 and [0].
           function Mock-OneConnectedDevice { '00000000-MOCK-IPHONE-UDID' }
           $devices = @(Mock-OneConnectedDevice)
           if ($devices.Count -ne 1) { throw "One-device normalization failed: Count=$($devices.Count)" }
           if ($devices[0] -ne '00000000-MOCK-IPHONE-UDID') { throw 'One-device indexing failed' }
 
-          # Every assignment used by the launcher must explicitly normalize pipeline output to an array.
-          $badAssignments = Select-String -Path $launcher -Pattern '^\s*\$devices\s*=\s*(?!@\().*Get-ConnectedDevice' -AllMatches
-          if ($badAssignments) {
+          # Ensure every real device-result assignment in the launcher is explicitly @(...)-wrapped.
+          $assignments = @(Select-String -Path $launcher -Pattern '^\s*\$devices\s*=.*Get-ConnectedDevice')
+          $badAssignments = @($assignments | Where-Object { $_.Line -notmatch '^\s*\$devices\s*=\s*@\(' })
+          if ($badAssignments.Count -ne 0) {
             $badAssignments | ForEach-Object { Write-Host $_.Line }
-            throw 'Found an unwrapped connected-device assignment that can become a scalar under Windows PowerShell 5.1'
+            throw 'Found an unwrapped connected-device assignment'
           }
           Write-Host 'Windows PowerShell 5.1 launcher regression test passed.'
 
-      - name: Download built IPA
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: Exp2011App-unsigned-ipa
           path: incoming
 
-      - name: Set up D compiler
-        uses: dlang-community/setup-dlang@v1
+      - uses: dlang-community/setup-dlang@v1
         with:
           compiler: ldc-1.33.0
 
@@ -123,92 +116,75 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile Sideloader-source.zip
           Expand-Archive Sideloader-source.zip -DestinationPath sideloader-src
           $dir = Get-ChildItem sideloader-src -Directory | Select-Object -First 1
-          if (-not $dir) { throw "Sideloader source archive did not extract" }
-          "SIDELOADER_DIR=$($dir.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          if (-not $dir) { throw 'Sideloader source archive did not extract' }
+          "SIDELOADER_DIR=$($dir.FullName)" | Out-File $env:GITHUB_ENV -Append
 
       - name: Apply Windows usability patch
         shell: pwsh
         run: python tools/sideloader/patch_sideloader.py "$env:SIDELOADER_DIR"
 
-      - name: Build Sideloader CLI from source
+      - name: Build Sideloader CLI
         shell: pwsh
         run: |
           Push-Location "$env:SIDELOADER_DIR"
           dub build -b release-debug --compiler=ldc2 :cli-frontend
           Pop-Location
-          if (-not (Test-Path "$env:SIDELOADER_DIR/bin/sideloader.exe")) {
-            throw "Sideloader build completed without bin/sideloader.exe"
-          }
+          if (-not (Test-Path "$env:SIDELOADER_DIR/bin/sideloader.exe")) { throw 'Missing sideloader.exe' }
 
-      - name: Download current Windows iPhone device runtime
+      - name: Download Windows iPhone runtime
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force device-runtime | Out-Null
           gh release download "$env:LIBIMOBILEDEVICE_WINDOWS_TAG" `
             --repo jrjr/libimobiledevice-windows `
-            --pattern "libimobile-suite-latest_w64.zip" `
+            --pattern 'libimobile-suite-latest_w64.zip' `
             --dir device-runtime
           Expand-Archive device-runtime/libimobile-suite-latest_w64.zip -DestinationPath device-runtime/extracted
 
-      - name: Assemble and smoke-test self-contained Windows package
+      - name: Assemble and smoke-test Windows package
         shell: pwsh
         run: |
           $dist = Join-Path $PWD 'dist/Exp2011App-OneClick-Windows'
           New-Item -ItemType Directory -Force $dist | Out-Null
-
           Copy-Item "$env:SIDELOADER_DIR/bin/sideloader.exe" "$dist/sideloader.exe"
-          Copy-Item "incoming/Exp2011App-unsigned.ipa" "$dist/Exp2011App-unsigned.ipa"
-          Copy-Item "tools/windows/Install-Hello-App.cmd" "$dist/Install-Hello-App.cmd"
-          Copy-Item "tools/windows/Install-Hello-App.ps1" "$dist/Install-Hello-App.ps1"
-          Copy-Item "Sideloader-source.zip" "$dist/Sideloader-source-$env:SIDELOADER_COMMIT.zip"
-          Copy-Item "device-runtime/extracted/*" $dist -Recurse -Force
+          Copy-Item incoming/Exp2011App-unsigned.ipa "$dist/Exp2011App-unsigned.ipa"
+          Copy-Item tools/windows/Install-Hello-App.cmd "$dist/Install-Hello-App.cmd"
+          Copy-Item tools/windows/Install-Hello-App.ps1 "$dist/Install-Hello-App.ps1"
+          Copy-Item Sideloader-source.zip "$dist/Sideloader-source-$env:SIDELOADER_COMMIT.zip"
+          Copy-Item 'device-runtime/extracted/*' $dist -Recurse -Force
 
           function Copy-DllAlias([string[]]$patterns, [string]$alias) {
             foreach ($pattern in $patterns) {
               $hit = Get-ChildItem $dist -File -Filter $pattern | Select-Object -First 1
               if ($hit) {
                 Copy-Item $hit.FullName (Join-Path $dist $alias) -Force
-                Write-Host "Alias $alias -> $($hit.Name)"
                 return
               }
             }
-            throw "Could not create $alias; none of these patterns existed: $($patterns -join ', ')"
+            throw "Could not create DLL alias $alias"
           }
-
           Copy-DllAlias @('libimobiledevice-1.0*.dll','libimobiledevice*.dll') 'imobiledevice.dll'
           Copy-DllAlias @('libplist-2.0*.dll','libplist*.dll') 'plist.dll'
           Copy-DllAlias @('libusbmuxd-2.0*.dll','libusbmuxd*.dll') 'usbmuxd.dll'
 
           if ($env:VCToolsRedistDir) {
             $crt = Join-Path $env:VCToolsRedistDir 'x64/Microsoft.VC143.CRT'
-            if (Test-Path $crt) {
-              Copy-Item "$crt/*.dll" $dist -Force
-            }
+            if (Test-Path $crt) { Copy-Item "$crt/*.dll" $dist -Force }
           }
 
           @"
           Exp2011App Hello Test - Windows installer bundle
-
-          iOS app source: this repository / current commit $env:GITHUB_SHA
-          Sideloader source: https://github.com/Dadoum/Sideloader/tree/$env:SIDELOADER_COMMIT
-          Sideloader license: GPL-3.0 (source archive included in this bundle)
-          Device runtime: https://github.com/jrjr/libimobiledevice-windows/releases/tag/$env:LIBIMOBILEDEVICE_WINDOWS_TAG
-
+          iOS source commit: $env:GITHUB_SHA
+          Sideloader commit: $env:SIDELOADER_COMMIT
           Start: double-click Install-Hello-App.cmd
           "@ | Set-Content "$dist/README-FIRST.txt"
 
           $required = @(
-            'sideloader.exe',
-            'Exp2011App-unsigned.ipa',
-            'idevice_id.exe',
-            'idevicepair.exe',
-            'idevicedevmodectl.exe',
-            'imobiledevice.dll',
-            'plist.dll',
-            'usbmuxd.dll'
+            'sideloader.exe','Exp2011App-unsigned.ipa','Install-Hello-App.cmd','Install-Hello-App.ps1',
+            'idevice_id.exe','idevicepair.exe','idevicedevmodectl.exe','imobiledevice.dll','plist.dll','usbmuxd.dll'
           )
           foreach ($name in $required) {
-            if (-not (Test-Path (Join-Path $dist $name))) { throw "Missing required packaged file: $name" }
+            if (-not (Test-Path (Join-Path $dist $name))) { throw "Missing packaged file: $name" }
           }
 
           Push-Location $dist
@@ -222,11 +198,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "idevicedevmodectl.exe smoke test failed: $LASTEXITCODE" }
           Pop-Location
 
-          Compress-Archive -Path "$dist/*" -DestinationPath "Exp2011App-OneClick-Windows.zip" -CompressionLevel Optimal
+          Compress-Archive -Path "$dist/*" -DestinationPath Exp2011App-OneClick-Windows.zip -CompressionLevel Optimal
           Get-FileHash Exp2011App-OneClick-Windows.zip -Algorithm SHA256
 
-      - name: Upload Windows installer artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: Exp2011App-OneClick-Windows
           path: Exp2011App-OneClick-Windows.zip
@@ -234,71 +209,40 @@ jobs:
           retention-days: 30
 
   release:
-    needs:
-      - build-ios
-      - build-windows-installer
+    needs: [build-ios, build-windows-installer]
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Download IPA
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
         with:
           name: Exp2011App-unsigned-ipa
           path: release-assets
-
-      - name: Download Windows bundle
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: Exp2011App-OneClick-Windows
           path: release-assets
 
-      - name: Create checksums
-        run: |
-          cd release-assets
-          sha256sum Exp2011App-unsigned.ipa Exp2011App-OneClick-Windows.zip > SHA256SUMS.txt
-          cat SHA256SUMS.txt
-
-      - name: Publish GitHub Release
+      - name: Create checksums and publish Release
         shell: bash
         run: |
           set -euo pipefail
+          cd release-assets
+          sha256sum Exp2011App-unsigned.ipa Exp2011App-OneClick-Windows.zip > SHA256SUMS.txt
+          cd ..
           TAG="hello-build-${GITHUB_RUN_NUMBER}"
-          NOTES="$(cat <<'TXT'
-          End-to-end Hello iPhone sideload test.
-
-          Windows first-time path:
-          1. Download `Exp2011App-OneClick-Windows.zip`.
-          2. Extract it.
-          3. Connect + unlock the iPhone and tap Trust if prompted.
-          4. Double-click `Install-Hello-App.cmd`.
-          5. Follow Developer Mode guidance if shown.
-          6. Enter the Apple development-account credentials/2FA requested by the open-source Sideloader.
-          7. Look for `exp2011app` on the phone.
-
-          The raw `Exp2011App-unsigned.ipa` is also attached. Once an on-device sideload manager such as SideStore is bootstrapped, that IPA is the file you can download directly from this Releases page on the iPhone and import there.
-
-          No MLX/model code is included yet. This release exists only to prove build -> release -> signing -> physical iPhone installation.
-          TXT
-          )"
           gh release create "$TAG" \
             release-assets/Exp2011App-unsigned.ipa \
             release-assets/Exp2011App-OneClick-Windows.zip \
             release-assets/SHA256SUMS.txt \
             --target "$GITHUB_SHA" \
             --title "Hello iPhone Test ${GITHUB_RUN_NUMBER}" \
-            --notes "$NOTES" \
+            --notes $'End-to-end Hello iPhone sideload test.\n\nDownload `Exp2011App-OneClick-Windows.zip`, extract it, connect and unlock the iPhone, then double-click `Install-Hello-App.cmd`.\n\nThe Windows launcher is regression-tested under Windows PowerShell 5.1 for 0/1/N device handling and the packaged executables are smoke-tested before this Release is published.' \
             --latest
 
   report-status:
-    needs:
-      - build-ios
-      - build-windows-installer
-      - release
+    needs: [build-ios, build-windows-installer, release]
     if: always() && (github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[skip release-status]'))
     runs-on: ubuntu-latest
     env:
@@ -306,7 +250,6 @@ jobs:
       IOS_RESULT: ${{ needs.build-ios.result }}
       WINDOWS_RESULT: ${{ needs.build-windows-installer.result }}
       RELEASE_RESULT: ${{ needs.release.result }}
-
     steps:
       - name: Write build-status.json to main
         shell: bash
@@ -322,19 +265,13 @@ jobs:
             --arg run_url "https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             '{run_id:$run_id,run_number:$run_number,source_sha:$source_sha,build_ios:$ios,build_windows_installer:$windows,release:$release,run_url:$run_url}' \
             > /tmp/build-status.json
-
           CONTENT="$(base64 -w0 /tmp/build-status.json)"
           OLD_SHA="$(gh api "repos/$GITHUB_REPOSITORY/contents/build-status.json?ref=main" --jq .sha 2>/dev/null || true)"
           if [[ -n "$OLD_SHA" ]]; then
             gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/build-status.json" \
-              -f message='Update build status [skip release-status]' \
-              -f content="$CONTENT" \
-              -f sha="$OLD_SHA" \
-              -f branch='main' >/dev/null
+              -f message='Update build status [skip release-status]' -f content="$CONTENT" -f sha="$OLD_SHA" -f branch=main >/dev/null
           else
             gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/build-status.json" \
-              -f message='Update build status [skip release-status]' \
-              -f content="$CONTENT" \
-              -f branch='main' >/dev/null
+              -f message='Update build status [skip release-status]' -f content="$CONTENT" -f branch=main >/dev/null
           fi
           cat /tmp/build-status.json
