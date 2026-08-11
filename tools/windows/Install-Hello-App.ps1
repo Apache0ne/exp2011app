@@ -32,8 +32,9 @@ function Install-AppleDeviceSupport {
 
     $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
     if ($winget) {
+        $wingetExe = $winget.Source
         Write-Host "Trying Microsoft Store install through WinGet..." -ForegroundColor Cyan
-        & $winget.Source install --id $appleDevicesStoreId --source msstore `
+        & $wingetExe install --id $appleDevicesStoreId --source msstore `
             --accept-source-agreements --accept-package-agreements `
             --silent --disable-interactivity
         if ($LASTEXITCODE -eq 0) {
@@ -62,7 +63,8 @@ function Ensure-DeveloperMode([string]$Udid) {
         return
     }
 
-    if ($statusText -notmatch '(?im)^\s*' + [regex]::Escape($Udid) + '\s+disabled\s*$') {
+    $disabledPattern = '(?im)^\s*' + [regex]::Escape($Udid) + '\s+disabled\s*$'
+    if ($statusText -notmatch $disabledPattern) {
         return
     }
 
