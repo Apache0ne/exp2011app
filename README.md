@@ -1,37 +1,60 @@
 # exp2011app
 
-Minimal native iPhone test app used to verify the complete GitHub -> iOS build -> IPA -> sideload path before adding any ML code.
+Minimal native iPhone test app used to prove the full path from **GitHub source -> Xcode device build -> GitHub Release -> Windows signing -> physical iPhone install** before adding any ML code.
 
-## What it does
+## What the app does
 
-The app is intentionally simple. It launches to a SwiftUI screen that says **Hello from exp2011app** and confirms that the basic iOS app is running.
+It is intentionally tiny. The SwiftUI screen only says:
 
-## Build an IPA on GitHub
+- **Hello from exp2011app**
+- **This basic iOS app is running on your iPhone.**
 
-1. Open the repository on GitHub.
-2. Open **Actions**.
-3. Run **Build iOS IPA** (or push a change to `main`).
-4. When the workflow finishes, download the `Exp2011App-unsigned-ipa` artifact.
-5. Extract the artifact ZIP to get `Exp2011App-unsigned.ipa`.
+No MLX, model download, networking, image editing, database, analytics, or other application logic is included yet.
 
-The GitHub workflow builds the app for a real iPhone with Xcode on a macOS runner. Code signing is deliberately disabled. A sideloading tool can re-sign the IPA with your Apple ID during installation.
+## Easiest first install from a GitHub Release
 
-## Sideload from Windows
+Open this repository's **Releases** page on the Windows PC and download the newest:
 
-The simplest test route is Sideloadly:
+`Exp2011App-OneClick-Windows.zip`
 
-1. Install Sideloadly on Windows.
-2. Connect the iPhone by USB and trust the computer.
-3. Drag `Exp2011App-unsigned.ipa` into Sideloadly.
-4. Select the iPhone and sign/install with your Apple ID.
-5. If iOS asks you to trust the developer profile, use **Settings -> General -> VPN & Device Management**.
+Then:
 
-A free Apple developer account normally requires the app to be re-signed periodically.
+1. Extract the ZIP.
+2. Connect the iPhone by USB and unlock it.
+3. Tap **Trust** on the iPhone if iOS asks whether to trust the computer.
+4. Double-click `Install-Hello-App.cmd`.
+5. Enter the Apple development-account credentials and 2FA code requested by the bundled open-source Sideloader.
+6. When it finishes, look for **exp2011app** on the iPhone.
 
-## Project layout
+If iOS blocks the first launch, enable **Settings -> Privacy & Security -> Developer Mode** if requested and trust the developer identity under **Settings -> General -> VPN & Device Management** if iOS shows it.
 
-- `App/` - the two SwiftUI source files.
-- `project.yml` - minimal XcodeGen project definition.
-- `.github/workflows/build-ios.yml` - generates the Xcode project, builds for `iphoneos`, packages `Payload/Exp2011App.app` into an unsigned IPA, and uploads it as a workflow artifact.
+A free Apple developer identity is enough for this test, but free provisioning normally expires after 7 days and the app must then be signed again.
 
-There is deliberately no MLX, model download, image picker, networking, database, or other application logic yet.
+## What the release contains
+
+- `Exp2011App-unsigned.ipa` - the real `iphoneos` build made by Xcode on GitHub's macOS runner.
+- `Exp2011App-OneClick-Windows.zip` - Windows bootstrap package containing the IPA, Dadoum Sideloader built from pinned source, current Windows libimobiledevice tools/runtime, and a guided install script.
+- `SHA256SUMS.txt` - checksums for both downloads.
+
+The Windows package includes the exact Sideloader source ZIP used for its binary build. Sideloader is GPL-3.0 licensed; the device communication runtime comes from the open-source libimobiledevice ecosystem.
+
+## Direct download on the iPhone later
+
+The raw IPA is deliberately published on every Release. After an on-device sideload manager such as SideStore has been bootstrapped once, the intended later workflow is:
+
+`GitHub Releases on iPhone -> download Exp2011App-unsigned.ipa -> import/open it in the on-device sideload manager -> sign/install`
+
+Plain iOS does not install an arbitrary unsigned IPA merely by tapping the download; it still needs a valid development signature/provisioning profile.
+
+## Build/release automation
+
+`.github/workflows/build-ios.yml` runs on every push to `main` and on manual dispatch. It:
+
+1. builds the native SwiftUI app for `iphoneos` with Xcode,
+2. packages the unsigned IPA,
+3. builds Dadoum Sideloader for Windows from pinned open-source source,
+4. bundles the current Windows libimobiledevice runtime and pairing tools,
+5. creates the Windows one-click ZIP,
+6. publishes both files to a new GitHub Release.
+
+All project changes are made directly on `main`; this repository does not require a PR/branch workflow for these experiments.
