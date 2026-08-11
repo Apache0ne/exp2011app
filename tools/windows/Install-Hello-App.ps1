@@ -6,6 +6,13 @@ Set-Location $root
 $env:PATH = "$root;$env:PATH"
 $appleDevicesStoreId = '9NP83LWLPZ9K'
 
+# Keep this experiment's Apple/ADI state separate from older Sideloader runs.
+# A native provisioning crash can leave partially-created ADI state behind.
+$stateBase = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { $env:APPDATA }
+$stateRoot = Join-Path $stateBase 'Exp2011App\SideloaderRuntime-v3'
+New-Item -ItemType Directory -Force $stateRoot | Out-Null
+$env:SIDELOADER_CONFIG_DIR = $stateRoot
+
 function Stop-Friendly([string]$Message, [int]$Code = 1) {
     Write-Host ""
     Write-Host "ERROR: $Message" -ForegroundColor Red
@@ -24,9 +31,23 @@ function Get-ConnectedDevices {
 }
 
 function Get-ConnectedDeviceArray {
-    # PowerShell unwraps a one-item pipeline result to a scalar. Always wrap the
-    # result here so .Count and [0] behave identically for 0, 1, or N devices.
+    # Windows PowerShell unwraps a one-item pipeline result to a scalar.
     return @(Get-ConnectedDevices)
+}
+
+function Start-AppleDevicesApp {
+    try {
+        $entry = Get-StartApps | Where-Object { $_.Name -eq 'Apple Devices' } | Select-Object -First 1
+        if ($entry) {
+            Write-Host "Starting Apple Devices..." -ForegroundColor Cyan
+            Start-Process "shell:AppsFolder\$($entry.AppID)" -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+            return $true
+        }
+    } catch {
+        Write-Host "Could not auto-start Apple Devices: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+    return $false
 }
 
 function Install-AppleDeviceSupport {
@@ -50,12 +71,14 @@ function Install-AppleDeviceSupport {
         }
     }
 
+    [void](Start-AppleDevicesApp)
     $devices = @(Get-ConnectedDeviceArray)
     if ($devices.Count -eq 0) {
         Write-Host "Opening the official Apple Devices Microsoft Store page..." -ForegroundColor Cyan
         Start-Process "ms-windows-store://pdp/?ProductId=$appleDevicesStoreId"
-        Write-Host "Install Apple Devices if the Store shows it is not installed."
-        Read-Host "After installation, reconnect/unlock the iPhone, tap Trust if prompted, then press Enter" | Out-Null
+        Write-Host "Install/open Apple Devices if the Store shows it is not already installed."
+        Read-Host "After Apple Devices is open, reconnect/unlock the iPhone, tap Trust if prompted, then press Enter" | Out-Null
+        [void](Start-AppleDevicesApp)
     }
 }
 
@@ -101,6 +124,7 @@ Write-Host ""
 Write-Host "This package signs the unsigned GitHub-built IPA with YOUR Apple"
 Write-Host "development identity and installs it to the connected iPhone."
 Write-Host "Apple credentials are handled by the bundled open-source Sideloader."
+Write-Host "Runtime state: $stateRoot"
 Write-Host ""
 
 $required = @(
@@ -117,6 +141,7 @@ foreach ($name in $required) {
 }
 
 Write-Host "Connect the iPhone by USB, unlock it, and leave it unlocked." -ForegroundColor Cyan
+[void](Start-AppleDevicesApp)
 $devices = @(Get-ConnectedDeviceArray)
 if ($devices.Count -eq 0) {
     Install-AppleDeviceSupport
@@ -128,11 +153,12 @@ if ($devices.Count -eq 0) {
     Write-Host "No iPhone is visible yet." -ForegroundColor Yellow
     Write-Host "Reconnect USB, unlock the phone, and tap Trust if iOS asks."
     Read-Host "Press Enter to retry detection" | Out-Null
+    [void](Start-AppleDevicesApp)
     $devices = @(Get-ConnectedDeviceArray)
 }
 
 if ($devices.Count -eq 0) {
-    Stop-Friendly "No iPhone was detected after installing/checking Apple Devices. Try another data-capable USB cable/port, open Apple Devices once, then rerun this installer."
+    Stop-Friendly "No iPhone was detected after installing/opening Apple Devices. Try another data-capable USB cable/port, open Apple Devices, then rerun this installer."
 }
 
 if ($devices.Count -gt 1) {
@@ -174,13 +200,17 @@ Ensure-DeveloperMode $udid
 
 Write-Host ""
 Write-Host "Starting Apple development signing + installation..." -ForegroundColor Cyan
+Write-Host "This build runs Sideloader with TRACE logging so native ADI/provisioning boundaries are visible."
 Write-Host "Sideloader will ask for an Apple ID/password and, when Apple requires it, a 2FA code."
 Write-Host "A free Apple developer identity is sufficient for this test; free provisioning normally expires after 7 days."
 Write-Host ""
 
-& (Join-Path $root 'sideloader.exe') install (Join-Path $root 'Exp2011App-unsigned.ipa') -i
+& (Join-Path $root 'sideloader.exe') -d install (Join-Path $root 'Exp2011App-unsigned.ipa') -i
 $installCode = $LASTEXITCODE
 if ($installCode -ne 0) {
+    if ($installCode -eq -1073741819) {
+        Stop-Friendly "Sideloader hit Windows native access violation 0xC0000005. Copy the final PROVISION-STAGE/TRACE lines above; they identify the exact native call that crashed." $installCode
+    }
     Stop-Friendly "Sideloader could not complete the install. The log above contains the exact failing step." $installCode
 }
 
