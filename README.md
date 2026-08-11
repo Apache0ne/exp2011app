@@ -21,22 +21,22 @@ Then:
 
 1. Extract the ZIP.
 2. Connect the iPhone by USB and unlock it.
-3. Tap **Trust** on the iPhone if iOS asks whether to trust the computer.
-4. Double-click `Install-Hello-App.cmd`.
-5. Enter the Apple development-account credentials and 2FA code requested by the bundled open-source Sideloader.
-6. When it finishes, look for **exp2011app** on the iPhone.
+3. Double-click `Install-Hello-App.cmd`.
+4. If Windows does not yet have Apple's USB/device support, the launcher attempts to install the official **Apple Devices** app from the Microsoft Store automatically and then retries the phone.
+5. Tap **Trust** on the iPhone when iOS asks.
+6. If Developer Mode is disabled, the launcher detects that and offers to enable/reveal it using the bundled open-source `idevicedevmodectl` helper. iOS may require a reboot/on-device confirmation.
+7. Enter the Apple development-account credentials and 2FA code requested by the bundled open-source Sideloader.
+8. When it finishes, open **exp2011app** on the iPhone.
 
-If iOS blocks the first launch, enable **Settings -> Privacy & Security -> Developer Mode** if requested and trust the developer identity under **Settings -> General -> VPN & Device Management** if iOS shows it.
-
-A free Apple developer identity is enough for this test, but free provisioning normally expires after 7 days and the app must then be signed again.
+A free Apple developer identity is enough for this test. Free provisioning normally expires after 7 days, so the app has to be signed again after that.
 
 ## What the release contains
 
-- `Exp2011App-unsigned.ipa` - the real `iphoneos` build made by Xcode on GitHub's macOS runner.
-- `Exp2011App-OneClick-Windows.zip` - Windows bootstrap package containing the IPA, Dadoum Sideloader built from pinned source, current Windows libimobiledevice tools/runtime, and a guided install script.
+- `Exp2011App-unsigned.ipa` - the real ARM64 `iphoneos` build made by Xcode on GitHub's macOS runner.
+- `Exp2011App-OneClick-Windows.zip` - Windows bootstrap package containing the IPA, Dadoum Sideloader built from pinned source, Windows libimobiledevice pairing/device tools and runtime, and the guided installer.
 - `SHA256SUMS.txt` - checksums for both downloads.
 
-The Windows package includes the exact Sideloader source ZIP used for its binary build. Sideloader is GPL-3.0 licensed; the device communication runtime comes from the open-source libimobiledevice ecosystem.
+The Windows package also contains the exact Sideloader source ZIP used to build its binary. Sideloader is GPL-3.0 licensed; the device communication runtime comes from the open-source libimobiledevice ecosystem.
 
 ## Direct download on the iPhone later
 
@@ -48,13 +48,14 @@ Plain iOS does not install an arbitrary unsigned IPA merely by tapping the downl
 
 ## Build/release automation
 
-`.github/workflows/build-ios.yml` runs on every push to `main` and on manual dispatch. It:
+`.github/workflows/build-ios.yml` runs on every normal push to `main` and on manual dispatch. It:
 
 1. builds the native SwiftUI app for `iphoneos` with Xcode,
 2. packages the unsigned IPA,
-3. builds Dadoum Sideloader for Windows from pinned open-source source,
-4. bundles the current Windows libimobiledevice runtime and pairing tools,
+3. builds Dadoum Sideloader for Windows from a pinned open-source commit,
+4. bundles the Windows libimobiledevice runtime and pairing tools,
 5. creates the Windows one-click ZIP,
-6. publishes both files to a new GitHub Release.
+6. publishes the IPA, Windows ZIP and SHA256 checksums to a new GitHub Release,
+7. writes the final CI result to `build-status.json` on `main` so the exact release pipeline can be verified.
 
-All project changes are made directly on `main`; this repository does not require a PR/branch workflow for these experiments.
+All experimental project changes are committed directly to `main`; no PR/branch workflow is used for this test repository.
