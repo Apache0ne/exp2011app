@@ -14,18 +14,21 @@ env:
   PROVISION_COMMIT: 645d56d8e8c86c057893321843db00b21f1aaeb2
   D_COMPILER: ldc-1.34.0
   LIBIMOBILEDEVICE_WINDOWS_TAG: v20260809-74585f8
+  LIBIMOBILEDEVICE_WINDOWS_SHA256: 441d2180b6f4669668b037f57f9a3403c3315e4147a29316b358f8ea886ecec8
 
 jobs:
   build-ios:
     if: github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[skip release-status]')
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
       - name: Install XcodeGen
         env:
           HOMEBREW_NO_AUTO_UPDATE: "1"
         run: brew install xcodegen
-      - name: Build real iPhone app
+
+      - name: Build and safety-check real iPhone app
         run: |
           set -euo pipefail
           xcodegen generate
@@ -33,28 +36,60 @@ jobs:
             -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
             -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY='' build
+
+          APP='build/Build/Products/Release-iphoneos/Exp2011App.app'
+          PLIST="$APP/Info.plist"
+          BIN="$APP/Exp2011App"
+          test -d "$APP"
+          test -f "$PLIST"
+          test -f "$BIN"
+
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST")
+          PLATFORM=$(/usr/libexec/PlistBuddy -c 'Print :DTPlatformName' "$PLIST")
+          test "$BUNDLE_ID" = 'com.apache0ne.exp2011app'
+          test "$PLATFORM" = 'iphoneos'
+          file "$BIN" | tee /tmp/app-file.txt
+          grep -q 'arm64' /tmp/app-file.txt
+
+          # The Hello test must not acquire privacy-sensitive permissions.
+          for key in \
+            NSCameraUsageDescription \
+            NSMicrophoneUsageDescription \
+            NSPhotoLibraryUsageDescription \
+            NSPhotoLibraryAddUsageDescription \
+            NSLocationWhenInUseUsageDescription \
+            NSLocationAlwaysAndWhenInUseUsageDescription \
+            NSContactsUsageDescription \
+            NSBluetoothAlwaysUsageDescription \
+            NSLocalNetworkUsageDescription; do
+            if /usr/libexec/PlistBuddy -c "Print :$key" "$PLIST" >/dev/null 2>&1; then
+              echo "Forbidden permission key in Hello test: $key" >&2
+              exit 1
+            fi
+          done
+          echo 'iOS Hello safety gate: PASS'
+
           mkdir Payload
-          cp -R build/Build/Products/Release-iphoneos/Exp2011App.app Payload/
+          cp -R "$APP" Payload/
           /usr/bin/zip -qry Exp2011App-unsigned.ipa Payload
           unzip -l Exp2011App-unsigned.ipa
           shasum -a 256 Exp2011App-unsigned.ipa
-      - uses: actions/upload-artifact@v4
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: Exp2011App-unsigned-ipa
           path: Exp2011App-unsigned.ipa
           if-no-files-found: error
           retention-days: 30
 
-  # Match Dadoum/Sideloader's own Windows CI path instead of compiling the
-  # SysV<->MSVC CoreADI bridge natively on Windows with a different LDC.
   build-sideloader-windows:
     if: github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[skip release-status]')
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
       - name: Set up Dadoum-compatible LDC
-        uses: dlang-community/setup-dlang@v1
+        uses: dlang-community/setup-dlang@2979e3ea011f6a234cd3a47dcbeb60f451c9635f
         with:
           compiler: ${{ env.D_COMPILER }}
 
@@ -67,7 +102,7 @@ jobs:
           ldc2 --version
           dub --version
 
-      - name: Fetch exact Sideloader source and apply local UI/trace patches
+      - name: Fetch exact Sideloader source and apply audited patches
         shell: bash
         run: |
           set -euo pipefail
@@ -75,6 +110,8 @@ jobs:
           git -C sideloader-src checkout --detach "$SIDELOADER_COMMIT"
           test "$(git -C sideloader-src rev-parse HEAD)" = "$SIDELOADER_COMMIT"
           python3 tools/sideloader/patch_sideloader.py sideloader-src
+          ! grep -R --line-number --fixed-strings 'request.sslSetVerifyPeer(false);' sideloader-src/source/app
+          grep -R --line-number --fixed-strings 'request.sslSetVerifyPeer(true);' sideloader-src/source/app
 
       # Keep this in lockstep with Dadoum/Sideloader's own
       # .github/actions/target-x86_64-windows-msvc/action.yml.
@@ -85,39 +122,39 @@ jobs:
           mkdir -p "$HOME/.ldc"
           LDC_VERSION_OUTPUT="$(ldc2 --version 2>&1)"
           LDC_VERSION="$(printf '%s\n' "$LDC_VERSION_OUTPUT" | sed -nE 's/^LDC - the LLVM D compiler \(([0-9]+\.[0-9]+\.[0-9]+)\):$/\1/p')"
-          test "$LDC_VERSION" = "1.34.0"
+          test "$LDC_VERSION" = '1.34.0'
 
           cat > "$HOME/.ldc/ldc2.conf" <<EOF
           "x86_64-.*-windows-msvc":
           {
-              // default switches injected before all explicit command-line switches
               switches = [
                   "-defaultlib=phobos2-ldc,druntime-ldc",
               ];
-              // default switches appended after all explicit command-line switches
               post-switches = [
                   "-I$HOME/ldc2-$LDC_VERSION-windows-x64/import",
               ];
-              // default directories to be searched for libraries when linking
               lib-dirs = [
                   "$HOME/ldc2-$LDC_VERSION-windows-x64/lib",
               ];
           };
           EOF
 
+          LDC_ARCHIVE="ldc2-$LDC_VERSION-windows-x64.7z"
           curl -fL --retry 3 \
-            "https://github.com/ldc-developers/ldc/releases/download/v$LDC_VERSION/ldc2-$LDC_VERSION-windows-x64.7z" \
-            -o "/tmp/ldc2-$LDC_VERSION-windows-x64.7z"
-          7z x "/tmp/ldc2-$LDC_VERSION-windows-x64.7z" -o"$HOME" > /dev/null
+            "https://github.com/ldc-developers/ldc/releases/download/v$LDC_VERSION/$LDC_ARCHIVE" \
+            -o "/tmp/$LDC_ARCHIVE"
+          curl -fL --retry 3 \
+            "https://github.com/ldc-developers/ldc/releases/download/v$LDC_VERSION/ldc2-$LDC_VERSION.sha256sums.txt" \
+            -o /tmp/ldc-sha256sums.txt
+          EXPECTED_LINE="$(grep "  $LDC_ARCHIVE$" /tmp/ldc-sha256sums.txt)"
+          test -n "$EXPECTED_LINE"
+          printf '%s\n' "$EXPECTED_LINE" | sed "s#  $LDC_ARCHIVE#  /tmp/$LDC_ARCHIVE#" | sha256sum -c -
 
+          7z x "/tmp/$LDC_ARCHIVE" -o"$HOME" > /dev/null
           test -d "$HOME/ldc2-$LDC_VERSION-windows-x64/import"
           test -d "$HOME/ldc2-$LDC_VERSION-windows-x64/lib"
-          echo '--- effective LDC target configuration ---'
-          cat "$HOME/.ldc/ldc2.conf"
-          echo '--- Windows LDC payload ---'
-          find "$HOME/ldc2-$LDC_VERSION-windows-x64" -maxdepth 2 -type d -print | sort
 
-      - name: Build Sideloader exactly for x86_64-windows-msvc
+      - name: Build Sideloader for x86_64-windows-msvc
         shell: bash
         run: |
           set -euo pipefail
@@ -141,12 +178,11 @@ jobs:
           Host: ubuntu-22.04
           Target: x86_64-windows-msvc
           Build: release-debug
-          Local source patches: hidden Windows password input + provisioning stage markers only
+          Local patches: TLS peer verification ON; hidden Windows password; provisioning stage markers
           EOF
           python3 - <<'PY'
           from pathlib import Path
           import zipfile
-
           root = Path('sideloader-src')
           out = Path('sideloader-dist/Sideloader-source.zip')
           excluded = {'.git', '.dub', 'bin'}
@@ -160,7 +196,7 @@ jobs:
           PY
           sha256sum sideloader-dist/*
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: sideloader-windows-msvc
           path: sideloader-dist/
@@ -173,9 +209,9 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
-      - name: Test launcher on Windows PowerShell 5.1
+      - name: Test launcher safety policy on Windows PowerShell 5.1
         shell: powershell
         run: |
           Set-StrictMode -Version Latest
@@ -183,25 +219,33 @@ jobs:
           $tokens = $null; $parseErrors = $null
           [void][System.Management.Automation.Language.Parser]::ParseFile($launcher,[ref]$tokens,[ref]$parseErrors)
           if (@($parseErrors).Count) { throw 'Launcher has PowerShell syntax errors' }
+
           function Mock-OneDevice { '00000000-MOCK-IPHONE' }
           $devices = @(Mock-OneDevice)
           if ($devices.Count -ne 1 -or $devices[0] -ne '00000000-MOCK-IPHONE') { throw 'One-device regression' }
           $matches = @(Select-String -Path $launcher -Pattern '^\s*\$devices\s*=.*Get-ConnectedDevice')
           $bad = @($matches | Where-Object { $_.Line -notmatch '^\s*\$devices\s*=\s*@\(' })
-          if ($bad.Count) { $bad | ForEach-Object { Write-Host $_.Line }; throw 'Found unwrapped device assignment' }
-          Write-Host 'PowerShell 5.1 launcher regression PASS'
+          if ($bad.Count) { throw 'Found unwrapped device assignment' }
 
-      - uses: actions/download-artifact@v4
+          $text = Get-Content $launcher -Raw
+          if ($text -match '(?im)^\s*&\s*\$winget.*\sinstall\s') { throw 'Launcher may not auto-install Windows packages' }
+          if ($text -match '(?im)^\s*&\s*\$tool.*\s+enable\s*$') { throw 'Launcher may not auto-enable Developer Mode' }
+          if ($text -match '(?im)sideloader\.exe.*-d\s+install') { throw 'User installer may not run Sideloader TRACE mode' }
+          if ($text -notmatch 'Assert-NotElevated') { throw 'Launcher must refuse Administrator mode' }
+          if ($text -notmatch 'Verify-BundleIntegrity') { throw 'Launcher must verify bundle hashes' }
+          Write-Host 'PowerShell 5.1 + non-destructive launcher safety gate: PASS'
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: Exp2011App-unsigned-ipa
           path: incoming
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: sideloader-windows-msvc
           path: sideloader-dist
 
-      - name: Verify Dadoum-parity Sideloader artifact
+      - name: Verify cross-built Sideloader starts on Windows
         shell: powershell
         run: |
           $exe = Join-Path $PWD 'sideloader-dist/sideloader.exe'
@@ -212,9 +256,7 @@ jobs:
           & $exe version
           if ($LASTEXITCODE) { throw 'Cross-built sideloader.exe did not start on Windows' }
 
-      # Execute the exact cross-built binary on Windows. This is the same
-      # Apple Music/CoreADI initialization/provisioning path that crashed on
-      # the physical PC, but it needs no iPhone or Apple login.
+      # CI may use debug output because no user's Apple credentials are present.
       - name: Real Windows CoreADI provisioning preflight
         shell: powershell
         run: |
@@ -236,15 +278,21 @@ jobs:
           if ($code -ne 1) { throw "Expected noninteractive no-login exit 1, got $code" }
           Write-Host 'REAL WINDOWS COREADI PROVISIONING PASS' -ForegroundColor Green
 
-      - name: Fetch Windows iPhone device runtime
+      - name: Fetch and verify pinned Windows iPhone device runtime
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force device-runtime | Out-Null
           gh release download "$env:LIBIMOBILEDEVICE_WINDOWS_TAG" --repo jrjr/libimobiledevice-windows `
             --pattern 'libimobile-suite-latest_w64.zip' --dir device-runtime
-          Expand-Archive device-runtime/libimobile-suite-latest_w64.zip device-runtime/extracted
+          $zip = Join-Path $PWD 'device-runtime/libimobile-suite-latest_w64.zip'
+          $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $env:LIBIMOBILEDEVICE_WINDOWS_SHA256) {
+            throw "libimobiledevice runtime SHA256 mismatch: $actual"
+          }
+          Write-Host "Pinned libimobiledevice SHA256 PASS: $actual"
+          Expand-Archive $zip device-runtime/extracted
 
-      - name: Package and smoke-test Windows installer
+      - name: Package, hash-manifest, and smoke-test Windows installer
         shell: pwsh
         run: |
           $dist = Join-Path $PWD 'dist/Exp2011App-OneClick-Windows'
@@ -273,29 +321,62 @@ jobs:
           }
 
           @"
-          Exp2011App Hello Test
+          Exp2011App SAFE Hello Test
           iOS source: $env:GITHUB_SHA
           Sideloader: $env:SIDELOADER_COMMIT
-          Provision: $env:PROVISION_COMMIT (upstream Sideloader pin)
+          Provision: $env:PROVISION_COMMIT (upstream pin)
           LDC: 1.34.0 release-debug
-          Build host: ubuntu-22.04
+          Sideloader build host: ubuntu-22.04
           Target: x86_64-windows-msvc
+          Apple Music APK TLS peer verification: REQUIRED
+          Pinned Windows device runtime SHA256: $env:LIBIMOBILEDEVICE_WINDOWS_SHA256
+          User installer elevation: REFUSED
+          Automatic Windows package installation: DISABLED
+          Automatic Developer Mode/reboot: DISABLED
+          User TRACE authentication logging: DISABLED
           GitHub Windows CoreADI provisioning preflight: PASS
           Run: Install-Hello-App.cmd
           "@ | Set-Content "$dist/README-FIRST.txt"
 
-          $required = @('sideloader.exe','sideloader-build-metadata.txt','Exp2011App-unsigned.ipa','Install-Hello-App.cmd','Install-Hello-App.ps1','idevice_id.exe','idevicepair.exe','idevicedevmodectl.exe','imobiledevice.dll','plist.dll','usbmuxd.dll')
-          foreach ($f in $required) { if (-not (Test-Path (Join-Path $dist $f))) { throw "Missing $f" } }
+          $required = @(
+            'sideloader.exe','sideloader-build-metadata.txt','Exp2011App-unsigned.ipa',
+            'Install-Hello-App.cmd','Install-Hello-App.ps1','idevice_id.exe',
+            'idevicepair.exe','idevicedevmodectl.exe','imobiledevice.dll','plist.dll','usbmuxd.dll'
+          )
+          foreach ($f in $required) {
+            if (-not (Test-Path (Join-Path $dist $f))) { throw "Missing $f" }
+          }
+
           Push-Location $dist
           & .\sideloader.exe version; if ($LASTEXITCODE) { throw 'sideloader smoke test failed' }
           & .\idevice_id.exe --version; if ($LASTEXITCODE) { throw 'idevice_id smoke test failed' }
           & .\idevicepair.exe --version; if ($LASTEXITCODE) { throw 'idevicepair smoke test failed' }
           & .\idevicedevmodectl.exe --version; if ($LASTEXITCODE) { throw 'idevicedevmodectl smoke test failed' }
           Pop-Location
+
+          $manifest = Join-Path $dist 'BUNDLE-SHA256SUMS.txt'
+          $manifestLines = foreach ($file in (Get-ChildItem $dist -Recurse -File | Sort-Object FullName)) {
+            if ($file.FullName -eq $manifest) { continue }
+            $relative = $file.FullName.Substring($dist.Length + 1)
+            $hash = (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToUpperInvariant()
+            "$hash`t$relative"
+          }
+          $manifestLines | Set-Content $manifest -Encoding ASCII
+          if (-not (Test-Path $manifest)) { throw 'Failed to create bundle SHA256 manifest' }
+
+          foreach ($line in (Get-Content $manifest)) {
+            $parts = $line -split "`t", 2
+            if ($parts.Count -ne 2) { throw "Bad manifest line: $line" }
+            $path = Join-Path $dist $parts[1]
+            $actual = (Get-FileHash $path -Algorithm SHA256).Hash.ToUpperInvariant()
+            if ($actual -ne $parts[0]) { throw "Manifest self-check failed: $($parts[1])" }
+          }
+          Write-Host 'Internal bundle SHA256 manifest: PASS'
+
           Compress-Archive "$dist/*" Exp2011App-OneClick-Windows.zip -CompressionLevel Optimal
           Get-FileHash Exp2011App-OneClick-Windows.zip -Algorithm SHA256
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: Exp2011App-OneClick-Windows
           path: Exp2011App-OneClick-Windows.zip
@@ -308,15 +389,16 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: Exp2011App-unsigned-ipa
           path: release-assets
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: Exp2011App-OneClick-Windows
           path: release-assets
-      - name: Publish gated Release
+
+      - name: Publish safety-gated Release
         shell: bash
         run: |
           set -euo pipefail
@@ -326,7 +408,7 @@ jobs:
           gh release create "hello-build-${GITHUB_RUN_NUMBER}" \
             release-assets/Exp2011App-unsigned.ipa release-assets/Exp2011App-OneClick-Windows.zip release-assets/SHA256SUMS.txt \
             --target "$GITHUB_SHA" --title "Hello iPhone Test ${GITHUB_RUN_NUMBER}" --latest \
-            --notes $'Windows one-click Hello iPhone test.\n\nThis Release is published only after Dadoum/Sideloader is cross-built with its Windows x86_64-msvc toolchain, then that exact executable completes fresh Apple Music/CoreADI provisioning on a GitHub Windows runner without a native crash.'
+            --notes $'Safety-gated Windows Hello iPhone test. The release is published only after the real ARM64 iPhone build, exact Dadoum Windows cross-build, TLS-hardened CoreADI preflight, pinned device-runtime SHA256 check, non-destructive launcher policy checks, binary smoke tests, and internal bundle SHA256 verification all pass. The user launcher does not auto-install Windows software, run elevated, auto-enable Developer Mode, reboot the iPhone, erase/restore/update the device, or enable TRACE authentication logging.'
 
   report-status:
     needs: [build-ios, build-sideloader-windows, build-windows-installer, release]
