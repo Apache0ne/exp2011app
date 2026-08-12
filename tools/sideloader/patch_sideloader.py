@@ -6,6 +6,7 @@ import sys
 
 EXPECTED_PROVISION_COMMIT = "645d56d8e8c86c057893321843db00b21f1aaeb2"
 EXPECTED_PROVISION_REPOSITORY = "git+https://github.com/Dadoum/Provision.git"
+EXPECTED_NATIVES_URL = "https://apps.mzstatic.com/content/android-apple-music-apk/applemusic.apk"
 
 
 def replace_once(text: str, old: str, new: str, label: str) -> str:
@@ -46,6 +47,32 @@ def verify_provision_pin(root: pathlib.Path) -> None:
         "Verified Dadoum/Sideloader upstream Provision pin: "
         f"{EXPECTED_PROVISION_COMMIT}"
     )
+
+
+def verify_apple_natives_url(root: pathlib.Path) -> None:
+    constants = root / "source" / "constants.d"
+    text = constants.read_text(encoding="utf-8")
+    expected = f'enum nativesUrl = "{EXPECTED_NATIVES_URL}";'
+    if expected not in text:
+        raise RuntimeError(
+            f"{constants}: Apple native-library URL changed; refusing to build. "
+            f"Expected exactly {EXPECTED_NATIVES_URL}"
+        )
+    print(f"Verified Apple natives URL: {EXPECTED_NATIVES_URL}")
+
+
+def patch_tls_verification(root: pathlib.Path) -> None:
+    app_file = root / "source" / "app" / "package.d"
+    text = app_file.read_text(encoding="utf-8")
+    text = replace_once(
+        text,
+        "    request.sslSetVerifyPeer(false);",
+        "    // exp2011app safety hardening: never disable TLS peer verification for executable native code.\n"
+        "    request.sslSetVerifyPeer(true);",
+        "Apple Music APK TLS verification patch",
+    )
+    app_file.write_text(text, encoding="utf-8")
+    print(f"Enabled TLS peer verification for Apple Music APK download: {app_file}")
 
 
 def patch_hidden_password(root: pathlib.Path) -> None:
@@ -93,7 +120,7 @@ def patch_hidden_password(root: pathlib.Path) -> None:
 
 
 def patch_stage_markers(root: pathlib.Path) -> None:
-    # INFO markers identify the exact native provisioning phase reached without
+    # INFO markers identify the exact provisioning phase reached without
     # changing the Provision dependency or the CoreADI ABI implementation.
     app_file = root / "source" / "app" / "package.d"
     text = app_file.read_text(encoding="utf-8")
@@ -110,13 +137,19 @@ def main() -> None:
 
     root = pathlib.Path(sys.argv[1]).resolve()
 
-    # Do not rewrite Dadoum's dependency graph. The native CoreADI bridge is
-    # sensitive to the exact source/toolchain combination, so fail if upstream
-    # no longer matches the revision we audited.
+    # Fail closed if the audited upstream dependency graph or Apple-hosted
+    # native-library source changes unexpectedly.
     verify_provision_pin(root)
+    verify_apple_natives_url(root)
+
+    # Security-only/local-observability changes. Do not alter Provision or the
+    # CoreADI ABI bridge itself.
+    patch_tls_verification(root)
     patch_hidden_password(root)
     patch_stage_markers(root)
+
     verify_provision_pin(root)
+    verify_apple_natives_url(root)
 
 
 if __name__ == "__main__":
