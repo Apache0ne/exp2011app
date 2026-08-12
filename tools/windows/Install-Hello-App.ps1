@@ -6,10 +6,10 @@ Set-Location $root
 $env:PATH = "$root;$env:PATH"
 $appleDevicesStoreId = '9NP83LWLPZ9K'
 
-# Keep this experiment's Apple/ADI state separate from older Sideloader runs.
-# A native provisioning crash can leave partially-created ADI state behind.
+# Keep this experiment's Apple/ADI state separate from other applications.
+# The installer writes only here and inside the extracted release folder.
 $stateBase = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { $env:APPDATA }
-$stateRoot = Join-Path $stateBase 'Exp2011App\SideloaderRuntime-v3'
+$stateRoot = Join-Path $stateBase 'Exp2011App\SideloaderRuntime-v4'
 New-Item -ItemType Directory -Force $stateRoot | Out-Null
 $env:SIDELOADER_CONFIG_DIR = $stateRoot
 
@@ -17,6 +17,53 @@ function Stop-Friendly([string]$Message, [int]$Code = 1) {
     Write-Host ""
     Write-Host "ERROR: $Message" -ForegroundColor Red
     exit $Code
+}
+
+function Assert-NotElevated {
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            Stop-Friendly "Do not run this installer as Administrator. Close it and run Install-Hello-App.cmd normally. The sideload flow does not require administrator privileges." 2
+        }
+    } catch {
+        Write-Host "Could not determine elevation state; continuing as the current user." -ForegroundColor Yellow
+    }
+}
+
+function Verify-BundleIntegrity {
+    $manifest = Join-Path $root 'BUNDLE-SHA256SUMS.txt'
+    if (-not (Test-Path $manifest)) {
+        Stop-Friendly "Safety manifest BUNDLE-SHA256SUMS.txt is missing. Do not run this package." 3
+    }
+
+    $entries = @(Get-Content $manifest | Where-Object { $_ -and -not $_.StartsWith('#') })
+    if ($entries.Count -eq 0) {
+        Stop-Friendly "Safety manifest is empty. Do not run this package." 3
+    }
+
+    foreach ($line in $entries) {
+        $parts = $line -split "`t", 2
+        if ($parts.Count -ne 2) {
+            Stop-Friendly "Malformed safety manifest entry: $line" 3
+        }
+        $expected = $parts[0].Trim().ToUpperInvariant()
+        $relative = $parts[1].Trim()
+        if ($expected -notmatch '^[0-9A-F]{64}$') {
+            Stop-Friendly "Invalid SHA256 in safety manifest for $relative" 3
+        }
+
+        $path = Join-Path $root $relative
+        if (-not (Test-Path $path -PathType Leaf)) {
+            Stop-Friendly "Release file is missing: $relative" 3
+        }
+        $actual = (Get-FileHash $path -Algorithm SHA256).Hash.ToUpperInvariant()
+        if ($actual -ne $expected) {
+            Stop-Friendly "Release integrity check failed for $relative. Delete this folder and download the ZIP again from GitHub Releases." 3
+        }
+    }
+
+    Write-Host "Release SHA256 integrity checks: PASS" -ForegroundColor Green
 }
 
 function Get-ConnectedDevices {
@@ -39,7 +86,7 @@ function Start-AppleDevicesApp {
     try {
         $entry = Get-StartApps | Where-Object { $_.Name -eq 'Apple Devices' } | Select-Object -First 1
         if ($entry) {
-            Write-Host "Starting Apple Devices..." -ForegroundColor Cyan
+            Write-Host "Starting the already-installed Apple Devices app..." -ForegroundColor Cyan
             Start-Process "shell:AppsFolder\$($entry.AppID)" -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 3
             return $true
@@ -50,45 +97,26 @@ function Start-AppleDevicesApp {
     return $false
 }
 
-function Install-AppleDeviceSupport {
+function Require-AppleDeviceSupport {
     Write-Host ""
-    Write-Host "Windows cannot see an Apple USB device yet." -ForegroundColor Yellow
-    Write-Host "Installing Apple's official Apple Devices component supplies the Windows"
-    Write-Host "Apple Mobile Device USB service used by libimobiledevice."
+    Write-Host "Windows cannot currently see the iPhone through Apple device services." -ForegroundColor Yellow
+    Write-Host "For safety, this installer will NOT install or modify Windows software automatically."
+    Write-Host "Install/open Apple's official 'Apple Devices' app from Microsoft Store, then reconnect and unlock the iPhone."
+    Write-Host "Microsoft Store product ID: $appleDevicesStoreId"
     Write-Host ""
-
-    $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
-    if ($winget) {
-        $wingetExe = $winget.Source
-        Write-Host "Trying Microsoft Store install through WinGet..." -ForegroundColor Cyan
-        & $wingetExe install --id $appleDevicesStoreId --source msstore `
-            --accept-source-agreements --accept-package-agreements `
-            --silent --disable-interactivity
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "Apple Devices install/update completed." -ForegroundColor Green
-        } else {
-            Write-Host "WinGet could not finish Apple Devices automatically (exit $LASTEXITCODE)." -ForegroundColor Yellow
-        }
-    }
-
-    [void](Start-AppleDevicesApp)
-    $devices = @(Get-ConnectedDeviceArray)
-    if ($devices.Count -eq 0) {
-        Write-Host "Opening the official Apple Devices Microsoft Store page..." -ForegroundColor Cyan
-        Start-Process "ms-windows-store://pdp/?ProductId=$appleDevicesStoreId"
-        Write-Host "Install/open Apple Devices if the Store shows it is not already installed."
-        Read-Host "After Apple Devices is open, reconnect/unlock the iPhone, tap Trust if prompted, then press Enter" | Out-Null
-        [void](Start-AppleDevicesApp)
-    }
+    Stop-Friendly "Apple device support is not ready. Open Apple Devices yourself, confirm the iPhone appears there, then rerun this installer." 4
 }
 
-function Ensure-DeveloperMode([string]$Udid) {
+function Require-DeveloperMode([string]$Udid) {
     $tool = Join-Path $root 'idevicedevmodectl.exe'
-    if (-not (Test-Path $tool)) { return }
+    if (-not (Test-Path $tool)) {
+        Stop-Friendly "Developer Mode status tool is missing from the release." 5
+    }
 
     try {
         $statusText = (& $tool --udid $Udid list 2>&1 | Out-String)
     } catch {
+        Write-Host "Could not read Developer Mode status. The installer will not attempt to change it automatically." -ForegroundColor Yellow
         return
     }
 
@@ -98,34 +126,31 @@ function Ensure-DeveloperMode([string]$Udid) {
     }
 
     Write-Host ""
-    Write-Host "Developer Mode is currently disabled on the iPhone." -ForegroundColor Yellow
-    Write-Host "A development-signed sideloaded app needs Developer Mode on iOS 16+."
-    Write-Host "The open-source idevicedevmodectl helper can enable/reveal it."
-    Write-Host "If the phone has no passcode this can reboot it automatically; with a passcode"
-    Write-Host "iOS normally requires you to enable the revealed switch on the phone itself."
-    $answer = Read-Host "Try to enable/reveal Developer Mode now? [Y/n]"
-    if ($answer -match '^(n|no)$') { return }
-
-    & $tool --udid $Udid enable
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host ""
-        Write-Host "Finish Developer Mode on the iPhone:" -ForegroundColor Yellow
-        Write-Host "Settings > Privacy & Security > Developer Mode"
-        Write-Host "iOS may reboot and ask for an on-device confirmation."
-        Read-Host "Press Enter after Developer Mode is enabled and the iPhone is unlocked again" | Out-Null
-    }
+    Write-Host "Developer Mode is disabled." -ForegroundColor Yellow
+    Write-Host "This installer intentionally will NOT enable it, reboot the phone, or change this security setting for you."
+    Write-Host "On the iPhone, manually use: Settings > Privacy & Security > Developer Mode."
+    Write-Host "iOS will explain the security impact and ask you to restart/confirm on the device."
+    Stop-Friendly "Enable Developer Mode manually on the iPhone, reconnect/unlock it after the restart, then rerun this installer." 5
 }
 
+Assert-NotElevated
+
 Write-Host ""
 Write-Host "============================================================"
-Write-Host " Exp2011App - iPhone installer"
+Write-Host " Exp2011App - SAFE Hello iPhone installer"
 Write-Host "============================================================"
 Write-Host ""
-Write-Host "This package signs the unsigned GitHub-built IPA with YOUR Apple"
-Write-Host "development identity and installs it to the connected iPhone."
-Write-Host "Apple credentials are handled by the bundled open-source Sideloader."
-Write-Host "Runtime state: $stateRoot"
+Write-Host "Safety policy for this build:" -ForegroundColor Cyan
+Write-Host "  - never runs as Administrator"
+Write-Host "  - never installs/updates Windows software automatically"
+Write-Host "  - never enables Developer Mode or reboots the iPhone automatically"
+Write-Host "  - never erases, restores, updates, or resets the iPhone"
+Write-Host "  - verifies packaged files with SHA256 before executing them"
+Write-Host "  - installs only the development-signed Exp2011App IPA after explicit confirmation"
+Write-Host "  - keeps its runtime state under: $stateRoot"
 Write-Host ""
+
+Verify-BundleIntegrity
 
 $required = @(
     'sideloader.exe',
@@ -136,47 +161,40 @@ $required = @(
 )
 foreach ($name in $required) {
     if (-not (Test-Path (Join-Path $root $name))) {
-        Stop-Friendly "The release package is incomplete: missing $name"
+        Stop-Friendly "The release package is incomplete: missing $name" 3
     }
 }
 
-Write-Host "Connect the iPhone by USB, unlock it, and leave it unlocked." -ForegroundColor Cyan
+Write-Host "Connect the iPhone by USB/USB-C, unlock it, and leave it unlocked." -ForegroundColor Cyan
 [void](Start-AppleDevicesApp)
 $devices = @(Get-ConnectedDeviceArray)
 if ($devices.Count -eq 0) {
-    Install-AppleDeviceSupport
-    Start-Sleep -Seconds 2
-    $devices = @(Get-ConnectedDeviceArray)
-}
-
-if ($devices.Count -eq 0) {
-    Write-Host "No iPhone is visible yet." -ForegroundColor Yellow
-    Write-Host "Reconnect USB, unlock the phone, and tap Trust if iOS asks."
-    Read-Host "Press Enter to retry detection" | Out-Null
-    [void](Start-AppleDevicesApp)
-    $devices = @(Get-ConnectedDeviceArray)
-}
-
-if ($devices.Count -eq 0) {
-    Stop-Friendly "No iPhone was detected after installing/opening Apple Devices. Try another data-capable USB cable/port, open Apple Devices, then rerun this installer."
+    Require-AppleDeviceSupport
 }
 
 if ($devices.Count -gt 1) {
     Write-Host "More than one iOS device is connected:" -ForegroundColor Yellow
     $devices | ForEach-Object { Write-Host "  $_" }
-    Stop-Friendly "For this first test, connect only the iPhone you want to install to."
+    Stop-Friendly "For this test, connect only the iPhone you want to install to." 4
 }
 
 $udid = [string]$devices[0]
 Write-Host "Detected iPhone: $udid" -ForegroundColor Green
-Write-Host "Checking trust/pairing..."
+Write-Host "Checking existing trust/pairing..."
 
 & (Join-Path $root 'idevicepair.exe') validate *> $null
 $paired = ($LASTEXITCODE -eq 0)
 
 if (-not $paired) {
-    Write-Host "The computer and iPhone are not paired yet." -ForegroundColor Yellow
-    Write-Host "Keep the iPhone unlocked and tap Trust when prompted."
+    Write-Host ""
+    Write-Host "This PC is not yet trusted/paired with the iPhone." -ForegroundColor Yellow
+    Write-Host "Pairing lets this Windows PC communicate with the unlocked iPhone while it remains trusted."
+    $pairAnswer = Read-Host "Type PAIR to request pairing; anything else exits"
+    if ($pairAnswer -cne 'PAIR') {
+        Stop-Friendly "Pairing cancelled. Nothing was installed on the iPhone." 6
+    }
+
+    Write-Host "Keep the iPhone unlocked and tap Trust only if you recognize this PC." -ForegroundColor Cyan
     for ($attempt = 1; $attempt -le 4; $attempt++) {
         $pairOutput = & (Join-Path $root 'idevicepair.exe') pair 2>&1
         if ($LASTEXITCODE -eq 0) {
@@ -185,33 +203,44 @@ if (-not $paired) {
         }
         Write-Host ($pairOutput | Out-String).Trim()
         if ($attempt -lt 4) {
-            Write-Host "Waiting for the Trust prompt..."
             Start-Sleep -Seconds 3
         }
     }
 }
 
 if (-not $paired) {
-    Stop-Friendly "Pairing did not complete. Unlock the iPhone, accept Trust, reconnect USB, then run this again."
+    Stop-Friendly "Pairing did not complete. No app installation was attempted." 6
 }
 
-Write-Host "Pairing OK." -ForegroundColor Green
-Ensure-DeveloperMode $udid
+Write-Host "Pairing/trust OK." -ForegroundColor Green
+Require-DeveloperMode $udid
+
+Write-Host ""
+Write-Host "The next operation WILL make only the changes required for sideloading:" -ForegroundColor Yellow
+Write-Host "  1. authenticate to Apple's developer services with the Apple account you enter"
+Write-Host "  2. register/use this device and create/download development signing material"
+Write-Host "  3. sign Exp2011App-unsigned.ipa"
+Write-Host "  4. install that app on this iPhone"
+Write-Host "It does NOT request an erase, restore, iOS update, factory reset, jailbreak, or filesystem modification outside the app install."
+Write-Host "A free Personal Team profile normally expires after 7 days."
+Write-Host ""
+$confirm = Read-Host "Type INSTALL to continue; anything else exits"
+if ($confirm -cne 'INSTALL') {
+    Stop-Friendly "Install cancelled. No app installation was attempted." 7
+}
 
 Write-Host ""
 Write-Host "Starting Apple development signing + installation..." -ForegroundColor Cyan
-Write-Host "This build runs Sideloader with TRACE logging so native ADI/provisioning boundaries are visible."
-Write-Host "Sideloader will ask for an Apple ID/password and, when Apple requires it, a 2FA code."
-Write-Host "A free Apple developer identity is sufficient for this test; free provisioning normally expires after 7 days."
+Write-Host "Password input is hidden. User-facing TRACE mode is disabled to reduce the chance of sensitive authentication data appearing in logs."
 Write-Host ""
 
-& (Join-Path $root 'sideloader.exe') -d install (Join-Path $root 'Exp2011App-unsigned.ipa') -i
+& (Join-Path $root 'sideloader.exe') install (Join-Path $root 'Exp2011App-unsigned.ipa') -i
 $installCode = $LASTEXITCODE
 if ($installCode -ne 0) {
     if ($installCode -eq -1073741819) {
-        Stop-Friendly "Sideloader hit Windows native access violation 0xC0000005. Copy the final PROVISION-STAGE/TRACE lines above; they identify the exact native call that crashed." $installCode
+        Stop-Friendly "Sideloader hit Windows native access violation 0xC0000005. Stop here; do not repeatedly retry this binary." $installCode
     }
-    Stop-Friendly "Sideloader could not complete the install. The log above contains the exact failing step." $installCode
+    Stop-Friendly "Sideloader could not complete the install. No erase/restore operation is part of this installer." $installCode
 }
 
 Write-Host ""
@@ -219,6 +248,6 @@ Write-Host "============================================================" -Foreg
 Write-Host " INSTALL COMPLETED" -ForegroundColor Green
 Write-Host "============================================================" -ForegroundColor Green
 Write-Host "Look for 'exp2011app' on the iPhone and open it."
-Write-Host "If iOS still blocks launch, finish Developer Mode under Settings > Privacy & Security"
-Write-Host "and trust your developer identity under Settings > General > VPN & Device Management if shown."
+Write-Host "To remove the test later: delete exp2011app normally from the iPhone."
+Write-Host "To restore the normal iPhone security posture after testing: turn Developer Mode off in Settings > Privacy & Security and restart as iOS requests."
 exit 0
