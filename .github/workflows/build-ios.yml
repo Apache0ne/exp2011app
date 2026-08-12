@@ -83,7 +83,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$HOME/.ldc"
-          LDC_VERSION=$(ldc2 --version | head -n 1 | grep -oE "[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*")
+          LDC_VERSION_OUTPUT="$(ldc2 --version 2>&1)"
+          LDC_VERSION="$(printf '%s\n' "$LDC_VERSION_OUTPUT" | sed -nE 's/^LDC - the LLVM D compiler \(([0-9]+\.[0-9]+\.[0-9]+)\):$/\1/p')"
           test "$LDC_VERSION" = "1.34.0"
 
           cat > "$HOME/.ldc/ldc2.conf" <<EOF
