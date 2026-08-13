@@ -64,15 +64,21 @@ def verify_apple_natives_url(root: pathlib.Path) -> None:
 def patch_tls_verification(root: pathlib.Path) -> None:
     app_file = root / "source" / "app" / "package.d"
     text = app_file.read_text(encoding="utf-8")
+
+    old = '''    Request request = Request();\n    request.sslSetVerifyPeer(false);\n    request.useStreaming = true;'''
+    new = '''    Request request = Request();\n    // exp2011app safety hardening: executable native code must only be\n    // downloaded over certificate-verified TLS. Windows OpenSSL does not\n    // automatically consume the Windows certificate store, so the launcher\n    // exports that read-only trust store to SSL_CERT_FILE and we require it.\n    request.sslSetVerifyPeer(true);\n    version (Windows) {\n        import std.process : environment;\n        auto caCertPath = environment.get("SSL_CERT_FILE", "");\n        if (caCertPath.length == 0 || !file.exists(caCertPath)) {\n            throw new Exception("SSL_CERT_FILE must point to a readable PEM trust bundle on Windows.");\n        }\n        request.sslSetCaCert(caCertPath);\n    }\n    request.useStreaming = true;'''
+
     text = replace_once(
         text,
-        "    request.sslSetVerifyPeer(false);",
-        "    // exp2011app safety hardening: never disable TLS peer verification for executable native code.\n"
-        "    request.sslSetVerifyPeer(true);",
-        "Apple Music APK TLS verification patch",
+        old,
+        new,
+        "Apple Music APK TLS verification + Windows CA patch",
     )
     app_file.write_text(text, encoding="utf-8")
-    print(f"Enabled TLS peer verification for Apple Music APK download: {app_file}")
+    print(
+        "Enabled TLS peer verification and explicit Windows CA trust for "
+        f"Apple Music APK download: {app_file}"
+    )
 
 
 def patch_hidden_password(root: pathlib.Path) -> None:
@@ -131,6 +137,22 @@ def patch_stage_markers(root: pathlib.Path) -> None:
     print(f"Added provisioning stage markers: {app_file}")
 
 
+def verify_hardened_tls_source(root: pathlib.Path) -> None:
+    app_file = root / "source" / "app" / "package.d"
+    text = app_file.read_text(encoding="utf-8")
+    required = (
+        "request.sslSetVerifyPeer(true);",
+        'environment.get("SSL_CERT_FILE", "")',
+        "request.sslSetCaCert(caCertPath);",
+    )
+    for marker in required:
+        if marker not in text:
+            raise RuntimeError(f"{app_file}: required TLS hardening marker missing: {marker}")
+    if "request.sslSetVerifyPeer(false);" in text:
+        raise RuntimeError(f"{app_file}: TLS peer verification is still disabled")
+    print("Verified fail-closed Windows TLS trust configuration")
+
+
 def main() -> None:
     if len(sys.argv) != 2:
         raise SystemExit("usage: patch_sideloader.py <Sideloader source root>")
@@ -142,14 +164,15 @@ def main() -> None:
     verify_provision_pin(root)
     verify_apple_natives_url(root)
 
-    # Security-only/local-observability changes. Do not alter Provision or the
-    # CoreADI ABI bridge itself.
+    # Security/local-observability changes only. Do not rewrite Provision or
+    # the CoreADI ABI bridge itself.
     patch_tls_verification(root)
     patch_hidden_password(root)
     patch_stage_markers(root)
 
     verify_provision_pin(root)
     verify_apple_natives_url(root)
+    verify_hardened_tls_source(root)
 
 
 if __name__ == "__main__":
