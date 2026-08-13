@@ -112,6 +112,8 @@ jobs:
           python3 tools/sideloader/patch_sideloader.py sideloader-src
           ! grep -R --line-number --fixed-strings 'request.sslSetVerifyPeer(false);' sideloader-src/source/app
           grep -R --line-number --fixed-strings 'request.sslSetVerifyPeer(true);' sideloader-src/source/app
+          grep -R --line-number --fixed-strings 'environment.get("SSL_CERT_FILE", "")' sideloader-src/source/app
+          grep -R --line-number --fixed-strings 'request.sslSetCaCert(caCertPath);' sideloader-src/source/app
 
       # Keep this in lockstep with Dadoum/Sideloader's own
       # .github/actions/target-x86_64-windows-msvc/action.yml.
@@ -178,7 +180,7 @@ jobs:
           Host: ubuntu-22.04
           Target: x86_64-windows-msvc
           Build: release-debug
-          Local patches: TLS peer verification ON; hidden Windows password; provisioning stage markers
+          Local patches: TLS peer verification ON + explicit SSL_CERT_FILE CA; hidden Windows password; provisioning stage markers
           EOF
           python3 - <<'PY'
           from pathlib import Path
@@ -216,9 +218,14 @@ jobs:
         run: |
           Set-StrictMode -Version Latest
           $launcher = Join-Path $PWD 'tools/windows/Install-Hello-App.ps1'
+          $trustHelper = Join-Path $PWD 'tools/windows/New-WindowsTrustBundle.ps1'
+
           $tokens = $null; $parseErrors = $null
           [void][System.Management.Automation.Language.Parser]::ParseFile($launcher,[ref]$tokens,[ref]$parseErrors)
           if (@($parseErrors).Count) { throw 'Launcher has PowerShell syntax errors' }
+          $trustTokens = $null; $trustParseErrors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile($trustHelper,[ref]$trustTokens,[ref]$trustParseErrors)
+          if (@($trustParseErrors).Count) { throw 'Windows trust helper has PowerShell syntax errors' }
 
           function Mock-OneDevice { '00000000-MOCK-IPHONE' }
           $devices = @(Mock-OneDevice)
@@ -233,7 +240,16 @@ jobs:
           if ($text -match '(?im)sideloader\.exe.*-d\s+install') { throw 'User installer may not run Sideloader TRACE mode' }
           if ($text -notmatch 'Assert-NotElevated') { throw 'Launcher must refuse Administrator mode' }
           if ($text -notmatch 'Verify-BundleIntegrity') { throw 'Launcher must verify bundle hashes' }
-          Write-Host 'PowerShell 5.1 + non-destructive launcher safety gate: PASS'
+          if ($text -notmatch 'Initialize-WindowsTlsTrust') { throw 'Launcher must initialize Windows-root TLS trust' }
+          if ($text -notmatch 'SSL_CERT_FILE') { throw 'Launcher must set SSL_CERT_FILE' }
+
+          $trustText = Get-Content $trustHelper -Raw
+          foreach ($forbidden in @('Import-Certificate','New-SelfSignedCertificate','certutil','Remove-Item Cert:','Move-Item Cert:','Set-Item Cert:')) {
+            if ($trustText -match [regex]::Escape($forbidden)) { throw "Trust helper contains forbidden certificate-store mutation token: $forbidden" }
+          }
+          if ($trustText -notmatch [regex]::Escape('Cert:\CurrentUser\Root')) { throw 'Trust helper must read CurrentUser Root store' }
+          if ($trustText -notmatch [regex]::Escape('Cert:\LocalMachine\Root')) { throw 'Trust helper must read LocalMachine Root store' }
+          Write-Host 'PowerShell 5.1 + non-destructive launcher/trust safety gate: PASS'
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
@@ -265,6 +281,13 @@ jobs:
           Remove-Item $preflight -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force $preflight | Out-Null
           $env:SIDELOADER_CONFIG_DIR = $preflight
+
+          $caFile = Join-Path $preflight 'windows-trusted-roots.pem'
+          & (Join-Path $PWD 'tools/windows/New-WindowsTrustBundle.ps1') -OutputPath $caFile
+          if (-not (Test-Path $caFile -PathType Leaf)) { throw 'Windows TLS trust export failed' }
+          $env:SSL_CERT_FILE = $caFile
+          Write-Host "CoreADI preflight SSL_CERT_FILE=$caFile"
+
           Push-Location (Join-Path $PWD 'sideloader-dist')
           $lines = @(& .\sideloader.exe -d team list 2>&1)
           $code = $LASTEXITCODE
@@ -303,6 +326,7 @@ jobs:
           Copy-Item 'sideloader-dist/Sideloader-source.zip' "$dist/Sideloader-source-$env:SIDELOADER_COMMIT.zip"
           Copy-Item incoming/Exp2011App-unsigned.ipa "$dist/Exp2011App-unsigned.ipa"
           Copy-Item tools/windows/Install-Hello-App.* $dist
+          Copy-Item tools/windows/New-WindowsTrustBundle.ps1 $dist
           Copy-Item 'device-runtime/extracted/*' $dist -Recurse -Force
 
           function Alias-Dll([string[]]$patterns,[string]$name) {
@@ -329,6 +353,7 @@ jobs:
           Sideloader build host: ubuntu-22.04
           Target: x86_64-windows-msvc
           Apple Music APK TLS peer verification: REQUIRED
+          TLS CA source on user PC: read-only Windows CurrentUser/LocalMachine trusted Root stores
           Pinned Windows device runtime SHA256: $env:LIBIMOBILEDEVICE_WINDOWS_SHA256
           User installer elevation: REFUSED
           Automatic Windows package installation: DISABLED
@@ -340,8 +365,9 @@ jobs:
 
           $required = @(
             'sideloader.exe','sideloader-build-metadata.txt','Exp2011App-unsigned.ipa',
-            'Install-Hello-App.cmd','Install-Hello-App.ps1','idevice_id.exe',
-            'idevicepair.exe','idevicedevmodectl.exe','imobiledevice.dll','plist.dll','usbmuxd.dll'
+            'Install-Hello-App.cmd','Install-Hello-App.ps1','New-WindowsTrustBundle.ps1',
+            'idevice_id.exe','idevicepair.exe','idevicedevmodectl.exe',
+            'imobiledevice.dll','plist.dll','usbmuxd.dll'
           )
           foreach ($f in $required) {
             if (-not (Test-Path (Join-Path $dist $f))) { throw "Missing $f" }
@@ -408,7 +434,7 @@ jobs:
           gh release create "hello-build-${GITHUB_RUN_NUMBER}" \
             release-assets/Exp2011App-unsigned.ipa release-assets/Exp2011App-OneClick-Windows.zip release-assets/SHA256SUMS.txt \
             --target "$GITHUB_SHA" --title "Hello iPhone Test ${GITHUB_RUN_NUMBER}" --latest \
-            --notes $'Safety-gated Windows Hello iPhone test. The release is published only after the real ARM64 iPhone build, exact Dadoum Windows cross-build, TLS-hardened CoreADI preflight, pinned device-runtime SHA256 check, non-destructive launcher policy checks, binary smoke tests, and internal bundle SHA256 verification all pass. The user launcher does not auto-install Windows software, run elevated, auto-enable Developer Mode, reboot the iPhone, erase/restore/update the device, or enable TRACE authentication logging.'
+            --notes $'Safety-gated Windows Hello iPhone test. The release is published only after the real ARM64 iPhone build, exact Dadoum Windows cross-build, certificate-verified Apple HTTPS/CoreADI preflight using Windows trusted roots, pinned device-runtime SHA256 check, non-destructive launcher policy checks, binary smoke tests, and internal bundle SHA256 verification all pass. The user launcher does not auto-install Windows software, run elevated, auto-enable Developer Mode, reboot the iPhone, erase/restore/update the device, or enable TRACE authentication logging.'
 
   report-status:
     needs: [build-ios, build-sideloader-windows, build-windows-installer, release]
