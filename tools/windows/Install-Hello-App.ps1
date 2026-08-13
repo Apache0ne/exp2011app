@@ -9,9 +9,7 @@ $appleDevicesStoreId = '9NP83LWLPZ9K'
 # Keep this experiment's Apple/ADI state separate from other applications.
 # The installer writes only here and inside the extracted release folder.
 $stateBase = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { $env:APPDATA }
-$stateRoot = Join-Path $stateBase 'Exp2011App\SideloaderRuntime-v4'
-New-Item -ItemType Directory -Force $stateRoot | Out-Null
-$env:SIDELOADER_CONFIG_DIR = $stateRoot
+$stateRoot = Join-Path $stateBase 'Exp2011App\SideloaderRuntime-v5'
 
 function Stop-Friendly([string]$Message, [int]$Code = 1) {
     Write-Host ""
@@ -64,6 +62,27 @@ function Verify-BundleIntegrity {
     }
 
     Write-Host "Release SHA256 integrity checks: PASS" -ForegroundColor Green
+}
+
+function Initialize-WindowsTlsTrust {
+    $helper = Join-Path $root 'New-WindowsTrustBundle.ps1'
+    if (-not (Test-Path $helper -PathType Leaf)) {
+        Stop-Friendly "Windows TLS trust helper is missing from the release." 3
+    }
+
+    $caFile = Join-Path $stateRoot 'windows-trusted-roots.pem'
+    try {
+        & $helper -OutputPath $caFile
+    } catch {
+        Stop-Friendly "Could not export the read-only Windows trusted-root certificate stores for TLS verification: $($_.Exception.Message)" 8
+    }
+
+    if (-not (Test-Path $caFile -PathType Leaf)) {
+        Stop-Friendly "Windows TLS trust bundle was not created." 8
+    }
+
+    $env:SSL_CERT_FILE = $caFile
+    Write-Host "Sideloader TLS trust: Windows trusted roots via SSL_CERT_FILE" -ForegroundColor Green
 }
 
 function Get-ConnectedDevices {
@@ -134,6 +153,8 @@ function Require-DeveloperMode([string]$Udid) {
 }
 
 Assert-NotElevated
+New-Item -ItemType Directory -Force $stateRoot | Out-Null
+$env:SIDELOADER_CONFIG_DIR = $stateRoot
 
 Write-Host ""
 Write-Host "============================================================"
@@ -146,18 +167,21 @@ Write-Host "  - never installs/updates Windows software automatically"
 Write-Host "  - never enables Developer Mode or reboots the iPhone automatically"
 Write-Host "  - never erases, restores, updates, or resets the iPhone"
 Write-Host "  - verifies packaged files with SHA256 before executing them"
+Write-Host "  - verifies Apple's native-library download with TLS using Windows trusted roots"
 Write-Host "  - installs only the development-signed Exp2011App IPA after explicit confirmation"
 Write-Host "  - keeps its runtime state under: $stateRoot"
 Write-Host ""
 
 Verify-BundleIntegrity
+Initialize-WindowsTlsTrust
 
 $required = @(
     'sideloader.exe',
     'Exp2011App-unsigned.ipa',
     'idevice_id.exe',
     'idevicepair.exe',
-    'idevicedevmodectl.exe'
+    'idevicedevmodectl.exe',
+    'New-WindowsTrustBundle.ps1'
 )
 foreach ($name in $required) {
     if (-not (Test-Path (Join-Path $root $name))) {
